@@ -7,20 +7,8 @@ use anyhow::Result;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
-const FIELD_SEPARATOR: char = '\u{1f}';
-const REVISION_TEMPLATE: &str = concat!(
-    "change_id.short() ++ \"",
-    "\u{1f}",
-    "\" ++ change_id() ++ \"",
-    "\u{1f}",
-    "\" ++ commit_id.short() ++ \"",
-    "\u{1f}",
-    "\" ++ if(empty, \"EMPTY\", \"NOTEMPTY\") ++ \"",
-    "\u{1f}",
-    "\" ++ parents.map(|p| p.change_id()).join(\",\") ++ \"",
-    "\u{1f}",
-    "\" ++ description.first_line() ++ \"\\n\"",
-);
+const FIELD_SEPARATOR: char = '|';
+const REVISION_TEMPLATE: &str = r#"change_id.short() ++ "|" ++ change_id ++ "|" ++ commit_id.short() ++ "|" ++ if(empty, "EMPTY", "NOTEMPTY") ++ "|" ++ "" ++ "|" ++ description.first_line() ++ "\n""#;
 
 /// Handles all Jujutsu (jj) operations
 pub struct JujutsuClient {

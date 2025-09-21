@@ -108,4 +108,3 @@ The tool maintains your PR stack structure:
 ## Files
 
 - `.almighty` - State file (PR associations, branch names)
-- `CLAUDE.local.md` - Optional project-specific documentation
