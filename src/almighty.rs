@@ -276,8 +276,19 @@ impl AlmightyPush {
 
             let branch_name = revisions[i].branch_name.as_ref().unwrap();
 
-            // Check the actual PR base
+            // Check the actual PR base (only for open PRs)
             if let Some(existing_pr) = self.github.get_existing_pr(branch_name)? {
+                // Skip verification for closed/merged PRs (default to "open" if empty)
+                let pr_state = if existing_pr.state.is_empty() {
+                    "open".to_string()
+                } else {
+                    existing_pr.state.to_lowercase()
+                };
+
+                if pr_state != "open" {
+                    continue;
+                }
+
                 if let Some(current_base) = existing_pr.base_ref_name {
                     if current_base != expected_base {
                         issues.push(format!(

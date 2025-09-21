@@ -546,11 +546,22 @@ impl GitHubClient {
 
         // Check if PR already exists
         if let Some(existing_pr) = self.get_existing_pr(branch_name)? {
-            // Update base if needed
-            if let Some(current_base) = existing_pr.base_ref_name {
-                if current_base != base_branch {
-                    self.update_pr_base(branch_name, base_branch)?;
+            // Check PR state - default to "open" if empty
+            let pr_state = if existing_pr.state.is_empty() {
+                "open"
+            } else {
+                &existing_pr.state.to_lowercase()
+            };
+
+            // Only update base if PR is open
+            if pr_state == "open" {
+                if let Some(current_base) = existing_pr.base_ref_name {
+                    if current_base != base_branch {
+                        self.update_pr_base(branch_name, base_branch)?;
+                    }
                 }
+            } else {
+                eprintln!("  PR for {} is {}, skipping base update", revision.short_change_id(), pr_state);
             }
 
             revision.pr_url = Some(existing_pr.url);
@@ -606,7 +617,7 @@ impl GitHubClient {
             "--repo",
             &repo_spec,
             "--json",
-            "url,baseRefName,headRefName,number",
+            "url,baseRefName,headRefName,number,state",
         ])?;
 
         if output.success() {
@@ -684,6 +695,24 @@ impl GitHubClient {
             }
 
             let branch_name = rev.branch_name.as_ref().unwrap();
+
+            // Check if PR is open before updating
+            if let Some(existing_pr) = self.get_existing_pr(branch_name)? {
+                let pr_state = if existing_pr.state.is_empty() {
+                    "open".to_string()
+                } else {
+                    existing_pr.state.to_lowercase()
+                };
+
+                if pr_state != "open" {
+                    eprintln!("  Skipping update for PR #{} ({}): PR is {}",
+                             rev.extract_pr_number().unwrap_or(0),
+                             rev.short_change_id(),
+                             pr_state);
+                    continue;
+                }
+            }
+
             let body = self.build_full_pr_body(rev, i, revisions);
             let title = &rev.description;
 
