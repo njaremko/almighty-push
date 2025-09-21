@@ -7,6 +7,21 @@ use anyhow::Result;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
+const FIELD_SEPARATOR: char = '\u{1f}';
+const REVISION_TEMPLATE: &str = concat!(
+    "change_id.short() ++ \"",
+    "\u{1f}",
+    "\" ++ change_id() ++ \"",
+    "\u{1f}",
+    "\" ++ commit_id.short() ++ \"",
+    "\u{1f}",
+    "\" ++ if(empty, \"EMPTY\", \"NOTEMPTY\") ++ \"",
+    "\u{1f}",
+    "\" ++ parents.map(|p| p.change_id()).join(\",\") ++ \"",
+    "\u{1f}",
+    "\" ++ description.first_line() ++ \"\\n\"",
+);
+
 /// Handles all Jujutsu (jj) operations
 pub struct JujutsuClient {
     executor: CommandExecutor,
@@ -88,21 +103,22 @@ impl JujutsuClient {
 
     /// Get all revisions in the current stack above the base bookmark
     pub fn get_revisions_above_base(&self, base_branch: &str) -> Result<Vec<Revision>> {
+        let revset = format!("{}@{}..@", base_branch, DEFAULT_REMOTE);
         let output = self.executor.run(&[
             "jj",
             "log",
             "-r",
-            &format!("{}@{}..@", base_branch, DEFAULT_REMOTE),
+            &revset,
             "--no-graph",
             "--template",
-            r#"change_id.short() ++ " " ++ commit_id.short() ++ " " ++ if(empty, "EMPTY", "NOTEMPTY") ++ " " ++ description.first_line() ++ "\n""#,
+            REVISION_TEMPLATE,
         ])?;
 
         if output.stdout.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut revisions = Vec::new();
+        let mut parsed_revisions = Vec::new();
         let mut skipped_empty = Vec::new();
 
         for line in output.stdout.lines() {
@@ -111,26 +127,38 @@ impl JujutsuClient {
                 continue;
             }
 
-            if let Some(revision) = self.parse_revision_line(line) {
-                if revision.description == "EMPTY" {
+            if let Some(parsed) = self.parse_revision_line(line) {
+                if parsed.is_empty {
                     skipped_empty.push(format!(
                         "{} ({})",
-                        revision.short_change_id(),
-                        revision.commit_id
+                        parsed.revision.short_change_id(),
+                        parsed.revision.commit_id
                     ));
                     continue;
                 }
-                revisions.push(revision);
+                parsed_revisions.push(parsed);
             }
         }
 
-        // Reverse to get bottom-up order (oldest first)
-        revisions.reverse();
+        if parsed_revisions.is_empty() {
+            if !skipped_empty.is_empty() {
+                eprintln!(
+                    "  (Skipped empty working copy: {})",
+                    skipped_empty.join(", ")
+                );
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut revisions = self.linearize_stack(parsed_revisions, base_branch)?;
 
         eprintln!("Found {} revisions to push", revisions.len());
 
         if !skipped_empty.is_empty() {
-            eprintln!("  (Skipped empty working copy: {})", skipped_empty[0]);
+            eprintln!(
+                "  (Skipped empty working copy: {})",
+                skipped_empty.join(", ")
+            );
         }
 
         // Validate revisions
@@ -143,27 +171,190 @@ impl JujutsuClient {
     }
 
     /// Parse a single revision line from jj log output
-    fn parse_revision_line(&self, line: &str) -> Option<Revision> {
-        let parts: Vec<&str> = line.splitn(4, ' ').collect();
-        if parts.len() < 3 {
+    fn parse_revision_line(&self, line: &str) -> Option<ParsedRevision> {
+        let parts: Vec<&str> = line.splitn(6, FIELD_SEPARATOR).collect();
+        if parts.len() < 5 {
             return None;
         }
 
         let change_id = parts[0].to_string();
-        let commit_id = parts[1].to_string();
-        let is_empty = parts[2];
-        let description = if parts.len() > 3 {
-            parts[3].trim().to_string()
+        let full_change_id = parts[1].to_string();
+        let commit_id = parts[2].to_string();
+        let is_empty = parts[3] == "EMPTY";
+        let parent_change_ids = if parts[4].trim().is_empty() {
+            Vec::new()
+        } else {
+            parts[4]
+                .split(',')
+                .filter(|parent| !parent.trim().is_empty())
+                .map(|parent| parent.trim().to_string())
+                .collect()
+        };
+
+        let description = if parts.len() > 5 {
+            let desc = parts[5].trim();
+            if desc.is_empty() {
+                "(no description)".to_string()
+            } else {
+                desc.to_string()
+            }
         } else {
             "(no description)".to_string()
         };
 
-        if is_empty == "EMPTY" {
-            // Return a marker revision for empty commits
-            return Some(Revision::new(change_id, commit_id, "EMPTY".to_string()));
+        Some(ParsedRevision {
+            revision: Revision::new(
+                change_id,
+                commit_id,
+                if is_empty {
+                    "EMPTY".to_string()
+                } else {
+                    description
+                },
+            ),
+            full_change_id,
+            parent_change_ids,
+            is_empty,
+        })
+    }
+
+    fn linearize_stack(
+        &self,
+        parsed_revisions: Vec<ParsedRevision>,
+        base_branch: &str,
+    ) -> Result<Vec<Revision>> {
+        if parsed_revisions.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Some(Revision::new(change_id, commit_id, description))
+        let mut id_to_index = HashMap::new();
+        for (index, parsed) in parsed_revisions.iter().enumerate() {
+            id_to_index.insert(parsed.full_change_id.clone(), index);
+        }
+
+        let mut child_map: HashMap<String, String> = HashMap::new();
+        let mut roots = Vec::new();
+
+        for parsed in &parsed_revisions {
+            let mut parents_in_stack = Vec::new();
+            for parent in &parsed.parent_change_ids {
+                if id_to_index.contains_key(parent) {
+                    parents_in_stack.push(parent.clone());
+                }
+            }
+
+            if parents_in_stack.len() > 1 {
+                let parent_labels: Vec<String> = parents_in_stack
+                    .iter()
+                    .filter_map(|parent| id_to_index.get(parent))
+                    .map(|index| {
+                        parsed_revisions[*index]
+                            .revision
+                            .short_change_id()
+                            .to_string()
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "Commit {} merges multiple stack entries ({}). Stacks must be linear.",
+                    parsed.revision.short_change_id(),
+                    parent_labels.join(", ")
+                );
+            }
+
+            if let Some(parent) = parents_in_stack.first() {
+                if let Some(existing_child) =
+                    child_map.insert(parent.clone(), parsed.full_change_id.clone())
+                {
+                    let existing = &parsed_revisions[*id_to_index
+                        .get(&existing_child)
+                        .expect("existing child must exist")];
+                    let parent_rev =
+                        &parsed_revisions[*id_to_index.get(parent).expect("parent must exist")];
+                    anyhow::bail!(
+                        "Stack branches at {} ({} and {} both depend on it). Rebase your stack to be linear before running almighty-push.",
+                        parent_rev.revision.short_change_id(),
+                        existing.revision.short_change_id(),
+                        parsed.revision.short_change_id()
+                    );
+                }
+            } else {
+                roots.push(parsed.full_change_id.clone());
+            }
+        }
+
+        if roots.is_empty() {
+            anyhow::bail!(
+                "Could not determine the base of your stack. Ensure your commits are descendants of {}@{}.",
+                base_branch,
+                DEFAULT_REMOTE
+            );
+        }
+
+        if roots.len() > 1 {
+            let root_labels: Vec<String> = roots
+                .iter()
+                .filter_map(|root| id_to_index.get(root))
+                .map(|index| {
+                    parsed_revisions[*index]
+                        .revision
+                        .short_change_id()
+                        .to_string()
+                })
+                .collect();
+            anyhow::bail!(
+                "Found multiple stack roots ({}). Rebase onto a single {}@{} ancestor before pushing.",
+                root_labels.join(", "),
+                base_branch,
+                DEFAULT_REMOTE
+            );
+        }
+
+        let root_id = roots[0].clone();
+        let mut ordered_ids = Vec::new();
+        let mut current = root_id.clone();
+        let mut visited = HashSet::new();
+
+        loop {
+            if !visited.insert(current.clone()) {
+                let rev =
+                    &parsed_revisions[*id_to_index.get(&current).expect("cycle node must exist")];
+                anyhow::bail!(
+                    "Detected a cycle while traversing the stack at {}. Rebase your stack to be linear.",
+                    rev.revision.short_change_id()
+                );
+            }
+
+            ordered_ids.push(current.clone());
+
+            if let Some(next) = child_map.get(&current) {
+                current = next.clone();
+            } else {
+                break;
+            }
+        }
+
+        if visited.len() != parsed_revisions.len() {
+            let missing: Vec<String> = parsed_revisions
+                .iter()
+                .filter(|parsed| !visited.contains(&parsed.full_change_id))
+                .map(|parsed| parsed.revision.short_change_id().to_string())
+                .collect();
+            anyhow::bail!(
+                "Could not connect all commits into a single stack (unreachable: {}). Rebase your stack to be linear before pushing.",
+                missing.join(", ")
+            );
+        }
+
+        let mut ordered_revisions = Vec::with_capacity(parsed_revisions.len());
+        for id in ordered_ids {
+            let index = id_to_index
+                .get(&id)
+                .copied()
+                .expect("ordered id must exist in map");
+            ordered_revisions.push(parsed_revisions[index].revision.clone());
+        }
+
+        Ok(ordered_revisions)
     }
 
     /// Validate that all revisions have descriptions
@@ -478,4 +669,12 @@ impl JujutsuClient {
 
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct ParsedRevision {
+    revision: Revision,
+    full_change_id: String,
+    parent_change_ids: Vec<String>,
+    is_empty: bool,
 }
