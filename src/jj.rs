@@ -3,7 +3,7 @@ use crate::constants::{
     CHANGES_BRANCH_PREFIX, DEFAULT_REMOTE, MAX_OPS_TO_CHECK, PUSH_BRANCH_PREFIX,
 };
 use crate::types::Revision;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
@@ -136,6 +136,18 @@ impl JujutsuClient {
         // Validate revisions
         self.validate_revisions(&revisions)?;
 
+        let original_order: Vec<String> =
+            revisions.iter().map(|rev| rev.change_id.clone()).collect();
+        let mut revisions = self.ensure_linear_stack(base_branch, revisions)?;
+        let reordered = revisions
+            .iter()
+            .map(|rev| rev.change_id.clone())
+            .collect::<Vec<_>>();
+
+        if reordered != original_order {
+            eprintln!("  Adjusted stack ordering to maintain a linear chain");
+        }
+
         // Fetch full descriptions
         self.fetch_full_descriptions(&mut revisions)?;
 
@@ -164,6 +176,155 @@ impl JujutsuClient {
         }
 
         Some(Revision::new(change_id, commit_id, description))
+    }
+
+    fn ensure_linear_stack(
+        &self,
+        base_branch: &str,
+        revisions: Vec<Revision>,
+    ) -> Result<Vec<Revision>> {
+        if revisions.len() <= 1 {
+            return Ok(revisions);
+        }
+
+        let parent_map = self.fetch_parent_map(base_branch)?;
+        let mut revision_map: HashMap<String, Revision> = revisions
+            .into_iter()
+            .map(|rev| (rev.change_id.clone(), rev))
+            .collect();
+        let revision_ids: HashSet<String> = revision_map.keys().cloned().collect();
+
+        let mut parent_in_stack: HashMap<String, Option<String>> = HashMap::new();
+        let mut child_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for change_id in &revision_ids {
+            let parents = parent_map.get(change_id).cloned().unwrap_or_else(Vec::new);
+
+            if parents.len() > 1 {
+                bail!(
+                    "merge commit detected in jj stack ({}); almighty-push requires a linear stack",
+                    change_id
+                );
+            }
+
+            let parent_in_stack_id = parents
+                .into_iter()
+                .find(|parent| revision_ids.contains(parent));
+
+            if let Some(parent) = parent_in_stack_id.clone() {
+                parent_in_stack.insert(change_id.clone(), Some(parent.clone()));
+                child_map.entry(parent).or_default().push(change_id.clone());
+            } else {
+                parent_in_stack.insert(change_id.clone(), None);
+            }
+        }
+
+        if let Some((parent, _children)) = child_map.iter().find(|(_, children)| children.len() > 1)
+        {
+            bail!(
+                "stack diverges after {} (multiple child commits); restack to a single linear chain before pushing",
+                parent
+            );
+        }
+
+        let base_candidates: Vec<String> = parent_in_stack
+            .iter()
+            .filter_map(|(change_id, parent)| {
+                if parent.is_none() {
+                    Some(change_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if base_candidates.is_empty() {
+            bail!(
+                "could not determine base of jj stack above {}@{}; ensure the stack is connected to the base branch",
+                base_branch, DEFAULT_REMOTE
+            );
+        }
+
+        if base_candidates.len() > 1 {
+            bail!(
+                "stack has multiple independent roots above {}@{}; restack to a single linear chain",
+                base_branch, DEFAULT_REMOTE
+            );
+        }
+
+        let mut ordered_ids = Vec::new();
+        let mut current = base_candidates[0].clone();
+        let total = revision_ids.len();
+
+        loop {
+            ordered_ids.push(current.clone());
+            if ordered_ids.len() == total {
+                break;
+            }
+
+            match child_map.get(&current).cloned() {
+                Some(children) if !children.is_empty() => {
+                    current = children[0].clone();
+                }
+                _ => {
+                    bail!(
+                        "stack appears disconnected after {}; restack to ensure a contiguous chain",
+                        current
+                    );
+                }
+            }
+        }
+
+        let mut ordered_revisions = Vec::new();
+        for change_id in ordered_ids {
+            if let Some(rev) = revision_map.remove(&change_id) {
+                ordered_revisions.push(rev);
+            }
+        }
+
+        if !revision_map.is_empty() {
+            bail!("failed to linearize jj stack; remaining commits could not be ordered");
+        }
+
+        Ok(ordered_revisions)
+    }
+
+    fn fetch_parent_map(&self, base_branch: &str) -> Result<HashMap<String, Vec<String>>> {
+        let output = self.executor.run(&[
+            "jj",
+            "log",
+            "-r",
+            &format!("{}@{}..@", base_branch, DEFAULT_REMOTE),
+            "--no-graph",
+            "--template",
+            r#"change_id.short() ++ " " ++ parents.map(|p| p.change_id().short()).join(" ") ++ "\n""#,
+        ])?;
+
+        let mut parent_map = HashMap::new();
+
+        for line in output.stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let mut parts = line.splitn(2, ' ');
+            let change_id = parts.next().map(|id| id.to_string()).unwrap_or_default();
+            let parent_str = parts.next().unwrap_or("").trim();
+
+            let parents = if parent_str.is_empty() {
+                Vec::new()
+            } else {
+                parent_str
+                    .split_whitespace()
+                    .map(|parent| parent.to_string())
+                    .collect()
+            };
+
+            parent_map.insert(change_id, parents);
+        }
+
+        Ok(parent_map)
     }
 
     /// Validate that all revisions have descriptions
