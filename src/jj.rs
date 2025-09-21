@@ -239,6 +239,58 @@ impl JujutsuClient {
         Ok(bookmarks)
     }
 
+    /// Delete local bookmarks for merged PRs
+    pub fn delete_local_bookmarks(&self, bookmarks: &[String]) -> Result<bool> {
+        if bookmarks.is_empty() {
+            return Ok(false);
+        }
+
+        eprintln!("\n  Deleting local bookmarks for merged PRs...");
+
+        let mut args = vec!["jj", "bookmark", "delete"];
+        for bookmark in bookmarks {
+            args.push(bookmark.as_str());
+        }
+
+        let output = self.executor.run_unchecked(&args)?;
+
+        if output.success() {
+            for bookmark in bookmarks {
+                eprintln!("    Deleted local bookmark: {}", bookmark);
+            }
+            Ok(true)
+        } else {
+            eprintln!(
+                "    warning: failed to delete local bookmarks: {}",
+                bookmarks.join(", ")
+            );
+            if !output.stderr.is_empty() {
+                eprintln!("             {}", output.stderr);
+            }
+            Ok(false)
+        }
+    }
+
+    /// Propagate bookmark deletions to the remote
+    pub fn push_deleted_bookmarks(&self) -> Result<()> {
+        eprintln!("    Running 'jj git push --deleted' to propagate deletions...");
+
+        let output = self
+            .executor
+            .run_unchecked(&["jj", "git", "push", "--deleted"])?;
+
+        if output.success() {
+            eprintln!("    Propagated bookmark deletions to remote");
+        } else {
+            eprintln!("    warning: failed to push bookmark deletions to remote");
+            if !output.stderr.is_empty() {
+                eprintln!("             {}", output.stderr);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Push revisions to remote using jj git push
     pub fn push_revisions(&self, revisions: &mut [Revision]) -> Result<()> {
         if revisions.is_empty() {
