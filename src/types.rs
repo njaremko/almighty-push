@@ -54,8 +54,8 @@ impl Revision {
     /// Extract PR number from URL
     pub fn extract_pr_number(&self) -> Option<u32> {
         self.pr_url.as_ref().and_then(|url| {
-            url.split('/')
-                .last()
+            url.rsplit('/')
+                .next()
                 .and_then(|num| num.parse::<u32>().ok())
         })
     }
