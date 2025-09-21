@@ -138,8 +138,81 @@ impl JujutsuClient {
 
         // Fetch full descriptions
         self.fetch_full_descriptions(&mut revisions)?;
+        self.ensure_linear_stack(base_branch, &revisions)?;
 
         Ok(revisions)
+    }
+
+    fn ensure_linear_stack(&self, base_branch: &str, revisions: &[Revision]) -> Result<()> {
+        if revisions.is_empty() {
+            return Ok(());
+        }
+
+        let revset = Self::stack_revset(base_branch);
+
+        let heads_expr = format!("heads({})", revset);
+        let heads = self.collect_revset_entries(&heads_expr, 10)?;
+        if heads.len() > 1 {
+            let preview = heads.join(", ");
+            anyhow::bail!(
+                "Multiple stack heads detected above {}: {}. Resolve the divergence (for example, by restacking with `jj rebase`) and try again. Inspect with: jj log -r \"{}\" --no-graph",
+                base_branch,
+                preview,
+                heads_expr
+            );
+        }
+
+        let roots_expr = format!("roots({})", revset);
+        let roots = self.collect_revset_entries(&roots_expr, 10)?;
+        if roots.len() > 1 {
+            let preview = roots.join(", ");
+            anyhow::bail!(
+                "Multiple independent roots detected above {}: {}. almighty-push requires a single linear stack. Inspect with: jj log -r \"{}\" --no-graph",
+                base_branch,
+                preview,
+                roots_expr
+            );
+        }
+
+        Ok(())
+    }
+
+    fn collect_revset_entries(&self, revset_expr: &str, limit: usize) -> Result<Vec<String>> {
+        let limit_str = limit.to_string();
+        let output = self.executor.run_unchecked(&[
+            "jj",
+            "log",
+            "-r",
+            revset_expr,
+            "--no-graph",
+            "--limit",
+            &limit_str,
+            "--template",
+            r#"change_id.short() ++ " " ++ description.first_line() ++ "\n""#,
+        ])?;
+
+        if !output.success() {
+            return Ok(Vec::new());
+        }
+
+        let entries = output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    fn stack_revset(base_branch: &str) -> String {
+        format!("{}@{}..@", base_branch, DEFAULT_REMOTE)
     }
 
     /// Parse a single revision line from jj log output

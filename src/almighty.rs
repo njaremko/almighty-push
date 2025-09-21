@@ -46,6 +46,8 @@ impl AlmightyPush {
 
         // Categorize revisions
         let (to_create, to_update) = self.categorize_revisions(revisions, &existing_branches)?;
+        let created_count = to_create.len();
+        let updated_count = to_update.len();
 
         // Check for PRs to reopen
         let mut updated_to_update = to_update;
@@ -60,14 +62,21 @@ impl AlmightyPush {
         self.jj.push_revisions(&mut all_revisions)?;
 
         // Copy updated branch names back to original revisions
-        for (i, rev) in all_revisions.iter().enumerate() {
+        let mut branch_assignments = HashMap::new();
+        for rev in &all_revisions {
             if let Some(branch_name) = &rev.branch_name {
-                revisions[i].branch_name = Some(branch_name.clone());
+                branch_assignments.insert(rev.change_id.clone(), branch_name.clone());
+            }
+        }
+
+        for revision in revisions.iter_mut() {
+            if let Some(branch_name) = branch_assignments.get(&revision.change_id) {
+                revision.branch_name = Some(branch_name.clone());
             }
         }
 
         // Print summary
-        self.print_push_summary(&all_revisions)?;
+        self.print_push_summary(created_count, updated_count)?;
 
         Ok(existing_branches)
     }
@@ -151,30 +160,20 @@ impl AlmightyPush {
     }
 
     /// Print summary of push operations
-    fn print_push_summary(&self, revisions: &[Revision]) -> Result<()> {
-        if revisions.is_empty() {
+    fn print_push_summary(&self, created_count: usize, updated_count: usize) -> Result<()> {
+        if created_count == 0 && updated_count == 0 {
             return Ok(());
         }
 
-        let (created, updated): (Vec<_>, Vec<_>) = revisions
-            .iter()
-            .partition(|r| r.branch_name.is_some() && !r.has_pr());
-
-        let created_count = created.len();
-        let updated_count = updated.len();
-        let total = created_count + updated_count;
-
-        if total > 0 {
-            if created_count > 0 && updated_count > 0 {
-                eprintln!(
-                    "  Created {} branches, updated {}",
-                    created_count, updated_count
-                );
-            } else if created_count > 0 {
-                eprintln!("  Created {} new branches", created_count);
-            } else {
-                eprintln!("  Updated {} existing branches", updated_count);
-            }
+        if created_count > 0 && updated_count > 0 {
+            eprintln!(
+                "  Created {} branches, updated {}",
+                created_count, updated_count
+            );
+        } else if created_count > 0 {
+            eprintln!("  Created {} new branches", created_count);
+        } else {
+            eprintln!("  Updated {} existing branches", updated_count);
         }
 
         Ok(())
