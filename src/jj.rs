@@ -140,13 +140,19 @@ impl JujutsuClient {
 
         let mut revisions = self.linearize_stack(parsed_revisions, base_branch)?;
 
-        eprintln!("Found {} revisions to push", revisions.len());
-
-        if !skipped_empty.is_empty() {
+        if self.executor.verbose {
             eprintln!(
-                "  (Skipped empty working copy: {})",
-                skipped_empty.join(", ")
+                "Found {} revision{} to push",
+                revisions.len(),
+                if revisions.len() == 1 { "" } else { "s" }
             );
+
+            if !skipped_empty.is_empty() {
+                eprintln!(
+                    "  (Skipped empty working copy: {})",
+                    skipped_empty.join(", ")
+                );
+            }
         }
 
         // Validate revisions
@@ -353,18 +359,28 @@ impl JujutsuClient {
 
         if !missing_descriptions.is_empty() {
             // Check if the last commit is the one without description (likely the working copy)
-            let is_working_copy = revisions.last()
-                .map(|last| missing_descriptions.iter().any(|rev| rev.change_id == last.change_id))
+            let is_working_copy = revisions
+                .last()
+                .map(|last| {
+                    missing_descriptions
+                        .iter()
+                        .any(|rev| rev.change_id == last.change_id)
+                })
                 .unwrap_or(false);
 
             eprintln!("\nerror: the following commits have no description:");
             for rev in &missing_descriptions {
-                let is_this_working_copy = revisions.last()
+                let is_this_working_copy = revisions
+                    .last()
                     .map(|last| last.change_id == rev.change_id)
                     .unwrap_or(false);
 
                 if is_this_working_copy {
-                    eprintln!("  - jj:{} (git:{}) [working copy @]", rev.short_change_id(), rev.commit_id);
+                    eprintln!(
+                        "  - jj:{} (git:{}) [working copy @]",
+                        rev.short_change_id(),
+                        rev.commit_id
+                    );
                 } else {
                     eprintln!("  - jj:{} (git:{})", rev.short_change_id(), rev.commit_id);
                 }
@@ -373,10 +389,11 @@ impl JujutsuClient {
             if is_working_copy {
                 eprintln!("\nYour working copy (@) has uncommitted changes with no description.");
                 eprintln!("To push your stack, you can:");
-                eprintln!("  1. Abandon your working copy: jj abandon @");
+                eprintln!("  1. Squash into the previous commit: jj squash");
                 eprintln!("  2. Add a description: jj describe -m \"Your changes\"");
+                eprintln!("  3. Abandon your working copy: jj abandon @");
                 if revisions.len() > 1 {
-                    eprintln!("  3. Move to the previous commit: jj edit @-");
+                    eprintln!("  4. Move to the previous commit: jj edit @-");
                 }
             } else {
                 eprintln!("\nAdd descriptions to all commits before pushing.");
@@ -447,7 +464,9 @@ impl JujutsuClient {
             return Ok(false);
         }
 
-        eprintln!("  Deleting local bookmarks...");
+        if self.executor.verbose {
+            eprintln!("  Deleting local bookmarks...");
+        }
 
         let mut args = vec!["jj", "bookmark", "delete"];
         for bookmark in bookmarks {
@@ -458,7 +477,9 @@ impl JujutsuClient {
 
         if output.success() {
             for bookmark in bookmarks {
-                eprintln!("    Deleted local bookmark: {}", bookmark);
+                if self.executor.verbose {
+                    eprintln!("    Deleted local bookmark: {}", bookmark);
+                }
             }
             Ok(true)
         } else {
@@ -475,14 +496,18 @@ impl JujutsuClient {
 
     /// Propagate bookmark deletions to the remote
     pub fn push_deleted_bookmarks(&self) -> Result<()> {
-        eprintln!("    Running 'jj git push --deleted' to propagate deletions...");
+        if self.executor.verbose {
+            eprintln!("    Running 'jj git push --deleted' to propagate deletions...");
+        }
 
         let output = self
             .executor
             .run_unchecked(&["jj", "git", "push", "--deleted"])?;
 
         if output.success() {
-            eprintln!("    Propagated bookmark deletions to remote");
+            if self.executor.verbose {
+                eprintln!("    Propagated bookmark deletions to remote");
+            }
         } else {
             eprintln!("    warning: failed to push bookmark deletions to remote");
             if !output.stderr.is_empty() {
@@ -585,7 +610,9 @@ impl JujutsuClient {
                     branch.contains(&change_id_short[..len])
                 }) {
                     rev.branch_name = Some(branch.clone());
-                    eprintln!("  Pushed {} as branch {}", rev.short_change_id(), branch);
+                    if self.executor.verbose {
+                        eprintln!("  Pushed {} as branch {}", rev.short_change_id(), branch);
+                    }
                     break;
                 }
             }
@@ -598,7 +625,9 @@ impl JujutsuClient {
                     &rev.change_id[..12.min(rev.change_id.len())]
                 );
                 rev.branch_name = Some(branch_name.clone());
-                eprintln!("  warning: assuming branch name: {}", branch_name);
+                if self.executor.verbose {
+                    eprintln!("  warning: assuming branch name: {}", branch_name);
+                }
             }
         }
 
@@ -631,7 +660,12 @@ impl JujutsuClient {
             }
 
             let line_lower = line.to_lowercase();
-            if line_lower.contains("squash") || line_lower.contains("abandon") {
+            // Enhanced detection for various operations that remove commits
+            if line_lower.contains("squash")
+                || line_lower.contains("abandon")
+                || line_lower.contains("fold")
+                || line_lower.contains("amend") && line_lower.contains("into")
+            {
                 squashed_change_ids.extend(Self::extract_change_ids(line));
             }
         }
@@ -644,12 +678,13 @@ impl JujutsuClient {
         let mut change_ids = HashSet::new();
 
         for word in text.split_whitespace() {
-            // Check if word looks like a change ID (8-12 hex chars)
-            if word.len() >= 8 && word.len() <= 12 {
+            // Check if word looks like a change ID (8-32 chars, more flexible)
+            if word.len() >= 8 && word.len() <= 32 {
                 let word_lower = word.to_lowercase();
+                // JJ change IDs use specific character set
                 if word_lower
                     .chars()
-                    .all(|c| c.is_ascii_hexdigit() || "klmnopqrstuvwxyz".contains(c))
+                    .all(|c| "klmnopqrstuvwxyz".contains(c) || c.is_ascii_digit())
                 {
                     change_ids.insert(word_lower);
                 }
@@ -659,6 +694,100 @@ impl JujutsuClient {
         change_ids
     }
 
+    /// Get detailed history of a specific commit including evolution
+    #[allow(dead_code)]
+    pub fn get_commit_history(&self, change_id: &str) -> Result<CommitHistory> {
+        let mut history = CommitHistory::default();
+
+        // Get predecessors
+        let pred_output = self.executor.run_unchecked(&[
+            "jj",
+            "log",
+            "-r",
+            change_id,
+            "--no-graph",
+            "--template",
+            r#"predecessors().map(|p| p.change_id()).join(",")"#,
+        ])?;
+
+        if pred_output.success() && !pred_output.stdout.trim().is_empty() {
+            history.predecessors = pred_output
+                .stdout
+                .trim()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        // Get operation history for this change
+        let op_output = self.executor.run_unchecked(&[
+            "jj",
+            "op",
+            "log",
+            "--limit",
+            "20",
+            "--no-graph",
+            "--template",
+            r#"if(description.contains(change_id), description ++ "\n", "")"#
+                .replace("change_id", change_id)
+                .as_str(),
+        ])?;
+
+        if op_output.success() {
+            history.operations = op_output
+                .stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        Ok(history)
+    }
+
+    /// Check if a change ID exists in the current repository
+    #[allow(dead_code)]
+    pub fn change_exists(&self, change_id: &str) -> Result<bool> {
+        let output = self.executor.run_unchecked(&[
+            "jj",
+            "log",
+            "-r",
+            change_id,
+            "--no-graph",
+            "--template",
+            "change_id",
+        ])?;
+
+        Ok(output.success() && !output.stdout.trim().is_empty())
+    }
+
+    /// Get all commits that were present in a previous operation
+    #[allow(dead_code)]
+    pub fn get_commits_at_operation(&self, op_id: &str) -> Result<HashSet<String>> {
+        let output = self.executor.run_unchecked(&[
+            "jj",
+            "log",
+            "--at-op",
+            op_id,
+            "-r",
+            "all()",
+            "--no-graph",
+            "--template",
+            r#"change_id ++ "\n""#,
+        ])?;
+
+        if !output.success() {
+            return Ok(HashSet::new());
+        }
+
+        Ok(output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect())
+    }
 }
 
 #[derive(Clone)]
@@ -667,4 +796,12 @@ struct ParsedRevision {
     full_change_id: String,
     parent_change_ids: Vec<String>,
     is_empty: bool,
+}
+
+/// Detailed history of a commit
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct CommitHistory {
+    pub predecessors: Vec<String>,
+    pub operations: Vec<String>,
 }

@@ -177,7 +177,9 @@ impl GitHubClient {
         ])?;
 
         if reopen_output.success() {
-            eprintln!("    Reopened PR #{}", pr_number);
+            if self.executor.verbose {
+                eprintln!("    Reopened PR #{}", pr_number);
+            }
 
             // Add comment
             let comment = "This PR was automatically reopened because the commit has been separated back out in the stack.";
@@ -229,16 +231,15 @@ impl GitHubClient {
         let state = self.state_manager.load()?;
 
         // Build a map of change_id -> PrInfo for quick lookups
-        let previous_prs: HashMap<String, &PrInfo> = state.prs
+        let previous_prs: HashMap<String, &PrInfo> = state
+            .prs
             .iter()
             .map(|pr| (pr.change_id.clone(), pr))
             .collect();
 
         // Get all branches we've ever tracked from state
-        let mut tracked_branches: HashSet<String> = state.prs
-            .iter()
-            .map(|pr| pr.branch_name.clone())
-            .collect();
+        let mut tracked_branches: HashSet<String> =
+            state.prs.iter().map(|pr| pr.branch_name.clone()).collect();
 
         // Also include branches from closed PRs
         for closed_pr in &state.closed_prs {
@@ -327,7 +328,7 @@ impl GitHubClient {
                 continue;
             }
 
-            let change_id = Self::extract_change_id_from_branch(branch_name);
+            let change_id = self.extract_change_id_from_branch(branch_name);
 
             if let Some(reason) = Self::should_close_pr(branch_name, change_id.as_deref(), &context)
             {
@@ -338,7 +339,6 @@ impl GitHubClient {
                 }
             }
         }
-
 
         self.handle_merged_pr_bookmarks(
             jj_client,
@@ -366,8 +366,6 @@ impl GitHubClient {
                 } else {
                     eprintln!("    (use --delete-branches to remove)");
                 }
-            } else {
-                eprintln!("  No orphaned PRs or branches to clean up");
             }
             return Ok(Vec::new());
         }
@@ -573,7 +571,8 @@ impl GitHubClient {
                 if existing_branches.contains_key(clean_bookmark)
                     && !active_branches.contains(clean_bookmark)
                     && !squashed_into_same.contains(clean_bookmark)
-                    && tracked_branches.contains(clean_bookmark)  // Only delete branches we've tracked
+                    && tracked_branches.contains(clean_bookmark)
+                // Only delete branches we've tracked
                 {
                     branches_to_delete.push(clean_bookmark.to_string());
                 }
@@ -584,7 +583,7 @@ impl GitHubClient {
     }
 
     /// Extract change ID from branch name
-    fn extract_change_id_from_branch(branch_name: &str) -> Option<String> {
+    fn extract_change_id_from_branch(&self, branch_name: &str) -> Option<String> {
         if let Some(stripped) = branch_name.strip_prefix(PUSH_BRANCH_PREFIX) {
             Some(stripped.to_string())
         } else {
@@ -794,7 +793,7 @@ impl GitHubClient {
     }
 
     /// Update the base branch of a PR
-    fn update_pr_base(&mut self, branch_name: &str, new_base: &str) -> Result<()> {
+    pub fn update_pr_base(&mut self, branch_name: &str, new_base: &str) -> Result<()> {
         let repo_spec = self.repo_spec()?;
         let output = self.executor.run_unchecked(&[
             "gh",
@@ -812,9 +811,95 @@ impl GitHubClient {
             if !output.stderr.is_empty() {
                 eprintln!("             {}", output.stderr);
             }
+        } else {
+            eprintln!("    Successfully updated PR base to {}", new_base);
         }
 
         Ok(())
+    }
+
+    /// Update multiple PR bases for reordered commits
+    pub fn update_pr_bases_for_reorder(
+        &mut self,
+        revisions: &[Revision],
+        pr_updates: &HashMap<u32, String>,
+    ) -> Result<()> {
+        if pr_updates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!("\nUpdating PR base branches for reordered commits...");
+
+        for (pr_number, branch_name) in pr_updates {
+            // Find the revision for this PR
+            let revision_idx = revisions
+                .iter()
+                .position(|r| r.pr_number == Some(*pr_number));
+
+            if let Some(idx) = revision_idx {
+                let new_base = if idx == 0 {
+                    crate::constants::DEFAULT_BASE_BRANCH.to_string()
+                } else {
+                    revisions[idx - 1]
+                        .branch_name
+                        .clone()
+                        .unwrap_or_else(|| crate::constants::DEFAULT_BASE_BRANCH.to_string())
+                };
+
+                self.update_pr_base(branch_name, &new_base)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enhanced orphaned PR detection with better squash/abandon detection
+    #[allow(dead_code)]
+    pub fn detect_orphaned_prs_enhanced(
+        &mut self,
+        current_revisions: &[Revision],
+        jj: &JujutsuClient,
+    ) -> Result<Vec<(u32, String, String)>> {
+        let mut orphaned = Vec::new();
+
+        // Get all our managed branches from GitHub
+        let existing_branches = self.get_existing_branches(false)?;
+
+        // Get recently squashed/abandoned commits
+        let squashed_commits = jj.get_recently_squashed_commits()?;
+
+        // Build set of current change IDs
+        let current_change_ids: HashSet<String> = current_revisions
+            .iter()
+            .map(|r| r.change_id.clone())
+            .collect();
+
+        // Check each existing branch
+        for (branch_name, _) in existing_branches {
+            // Extract change ID from branch name
+            let change_id = self.extract_change_id_from_branch(&branch_name);
+
+            if let Some(change_id) = change_id {
+                // Check if this change still exists
+                let is_orphaned = !current_change_ids.contains(&change_id)
+                    || squashed_commits.iter().any(|s| change_id.starts_with(s));
+
+                if is_orphaned {
+                    // Get PR info
+                    if let Some(pr) = self.get_existing_pr(&branch_name)? {
+                        let reason = if squashed_commits.iter().any(|s| change_id.starts_with(s)) {
+                            "squashed or abandoned".to_string()
+                        } else {
+                            "commit no longer in stack".to_string()
+                        };
+
+                        orphaned.push((pr.number, branch_name.clone(), reason));
+                    }
+                }
+            }
+        }
+
+        Ok(orphaned)
     }
 
     /// Build the PR body with stack information

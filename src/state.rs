@@ -12,6 +12,12 @@ pub struct StateManager {
     state_file: PathBuf,
 }
 
+impl Default for StateManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateManager {
     /// Create a new StateManager
     pub fn new() -> Self {
@@ -28,7 +34,7 @@ impl StateManager {
         }
     }
 
-    /// Load state from file
+    /// Load state from file with conflict resolution
     pub fn load(&self) -> Result<State> {
         if !self.state_file.exists() {
             return Ok(State::default());
@@ -37,9 +43,21 @@ impl StateManager {
         let contents = fs::read_to_string(&self.state_file)
             .with_context(|| format!("Failed to read state file: {:?}", self.state_file))?;
 
+        // Check for merge conflict markers
+        if self.has_merge_conflicts(&contents) {
+            eprintln!("  warning: detected merge conflicts in state file, attempting recovery...");
+            return self.recover_from_conflicts(&contents);
+        }
+
         // First parse as generic JSON to check version and handle legacy format
-        let json_value: Value = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse state file: {:?}", self.state_file))?;
+        let json_value: Value = match serde_json::from_str(&contents) {
+            Ok(val) => val,
+            Err(e) => {
+                eprintln!("  warning: corrupted state file, resetting: {}", e);
+                self.backup_corrupted_state(&contents)?;
+                return Ok(State::default());
+            }
+        };
 
         let mut state = if let Some(_version) = json_value.get("version").and_then(|v| v.as_u64()) {
             // Has version field, parse normally
@@ -52,6 +70,9 @@ impl StateManager {
 
         // Migrate state if needed
         self.migrate_state(&mut state)?;
+
+        // Validate and clean up state
+        self.validate_and_clean_state(&mut state)?;
 
         Ok(state)
     }
@@ -71,8 +92,8 @@ impl StateManager {
             bookmarks: HashSet<String>,
         }
 
-        let v1: StateV1 = serde_json::from_value(json_value)
-            .context("Failed to parse v1 state format")?;
+        let v1: StateV1 =
+            serde_json::from_value(json_value).context("Failed to parse v1 state format")?;
 
         let mut state = State {
             version: 0, // Mark as v0/v1 for migration
@@ -136,7 +157,10 @@ impl StateManager {
 
         // Version 0/1 -> Version 2: Convert HashMaps to Vecs
         if state.version < 2 {
-            eprintln!("  Migrating state file from version {} to {}", state.version, STATE_VERSION);
+            eprintln!(
+                "  Migrating state file from version {} to {}",
+                state.version, STATE_VERSION
+            );
 
             // Migrate from v1 format if needed
             state.migrate_from_v1();
@@ -210,7 +234,9 @@ impl StateManager {
                 });
             }
             // Sort for consistent ordering
-            state.closed_prs.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+            state
+                .closed_prs
+                .sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
         }
 
         // Save bookmarks as a sorted list
@@ -258,5 +284,145 @@ impl StateManager {
             .collect();
 
         Ok(disappeared)
+    }
+
+    /// Check if content has merge conflict markers
+    fn has_merge_conflicts(&self, contents: &str) -> bool {
+        contents.contains("<<<<<<<") || contents.contains("=======") || contents.contains(">>>>>>>")
+    }
+
+    /// Attempt to recover from merge conflicts by taking the latest valid state
+    fn recover_from_conflicts(&self, contents: &str) -> Result<State> {
+        // Try to extract valid JSON sections between conflict markers
+        let lines: Vec<&str> = contents.lines().collect();
+        let mut json_sections = Vec::new();
+        let mut current_section = String::new();
+        let mut in_conflict = false;
+
+        for line in lines {
+            if line.starts_with("<<<<<<<") {
+                if !current_section.trim().is_empty() {
+                    json_sections.push(current_section.clone());
+                    current_section.clear();
+                }
+                in_conflict = true;
+            } else if line.starts_with("=======") {
+                if !current_section.trim().is_empty() {
+                    json_sections.push(current_section.clone());
+                    current_section.clear();
+                }
+            } else if line.starts_with(">>>>>>>") {
+                if !current_section.trim().is_empty() {
+                    json_sections.push(current_section.clone());
+                    current_section.clear();
+                }
+                in_conflict = false;
+            } else if !in_conflict {
+                current_section.push_str(line);
+                current_section.push('\n');
+            }
+        }
+
+        if !current_section.trim().is_empty() {
+            json_sections.push(current_section);
+        }
+
+        // Try to parse each section and merge them
+        let mut merged_state = State::default();
+        let mut found_valid = false;
+
+        for section in json_sections {
+            if let Ok(state) = serde_json::from_str::<State>(&section) {
+                found_valid = true;
+                // Merge states, taking the most recent data
+                self.merge_states(&mut merged_state, &state);
+            }
+        }
+
+        if found_valid {
+            eprintln!("  Successfully recovered state from conflicts");
+            // Save the recovered state
+            self.write_state(&merged_state)?;
+            Ok(merged_state)
+        } else {
+            eprintln!("  Could not recover state from conflicts, using default");
+            Ok(State::default())
+        }
+    }
+
+    /// Merge two states, preferring newer data
+    fn merge_states(&self, target: &mut State, source: &State) {
+        // Keep the latest version
+        target.version = target.version.max(source.version);
+
+        // Keep the most recent run time
+        if source.last_run > target.last_run {
+            target.last_run = source.last_run;
+        }
+
+        // Merge PRs, deduplicating by change_id
+        let mut pr_map: HashMap<String, PrInfo> = HashMap::new();
+        for pr in &target.prs {
+            pr_map.insert(pr.change_id.clone(), pr.clone());
+        }
+        for pr in &source.prs {
+            pr_map.insert(pr.change_id.clone(), pr.clone());
+        }
+        target.prs = pr_map.into_values().collect();
+        target.prs.sort_by(|a, b| a.change_id.cmp(&b.change_id));
+
+        // Merge closed PRs, deduplicating by branch_name
+        let mut closed_map: HashMap<String, ClosedPrInfo> = HashMap::new();
+        for pr in &target.closed_prs {
+            closed_map.insert(pr.branch_name.clone(), pr.clone());
+        }
+        for pr in &source.closed_prs {
+            closed_map.insert(pr.branch_name.clone(), pr.clone());
+        }
+        target.closed_prs = closed_map.into_values().collect();
+        target
+            .closed_prs
+            .sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+
+        // Merge bookmarks
+        let mut bookmark_set: HashSet<String> = target.bookmarks.iter().cloned().collect();
+        bookmark_set.extend(source.bookmarks.iter().cloned());
+        target.bookmarks = bookmark_set.into_iter().collect();
+        target.bookmarks.sort();
+    }
+
+    /// Backup corrupted state file
+    fn backup_corrupted_state(&self, contents: &str) -> Result<()> {
+        let backup_path = self.state_file.with_extension("corrupted.bak");
+        fs::write(&backup_path, contents)
+            .with_context(|| format!("Failed to backup corrupted state to {:?}", backup_path))?;
+        eprintln!("  Corrupted state backed up to {:?}", backup_path);
+        Ok(())
+    }
+
+    /// Validate and clean up state
+    fn validate_and_clean_state(&self, state: &mut State) -> Result<()> {
+        // Remove duplicate PR entries
+        let mut seen = HashSet::new();
+        state.prs.retain(|pr| seen.insert(pr.change_id.clone()));
+
+        // Remove duplicate closed PR entries
+        seen.clear();
+        state
+            .closed_prs
+            .retain(|pr| seen.insert(pr.branch_name.clone()));
+
+        // Clean up stale closed PRs (older than 30 days)
+        let cutoff = chrono::Local::now() - chrono::Duration::days(30);
+        state.closed_prs.retain(|pr| pr.closed_at > cutoff);
+
+        // Sort for consistency
+        state.prs.sort_by(|a, b| a.change_id.cmp(&b.change_id));
+        state
+            .closed_prs
+            .sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+        state.bookmarks.sort();
+
+        Ok(())
     }
 }

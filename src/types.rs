@@ -124,7 +124,8 @@ impl State {
     pub fn migrate_from_v1(&mut self) {
         // Migrate PRs from map to vec
         if !self.prs_map.is_empty() {
-            self.prs = self.prs_map
+            self.prs = self
+                .prs_map
                 .iter()
                 .map(|(change_id, info)| PrInfo {
                     change_id: change_id.clone(),
@@ -142,7 +143,8 @@ impl State {
 
         // Migrate closed PRs from map to vec
         if !self.closed_prs_map.is_empty() {
-            self.closed_prs = self.closed_prs_map
+            self.closed_prs = self
+                .closed_prs_map
                 .iter()
                 .map(|(branch_name, info)| ClosedPrInfo {
                     branch_name: branch_name.clone(),
@@ -151,7 +153,8 @@ impl State {
                     reason: info.reason.clone(),
                 })
                 .collect();
-            self.closed_prs.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+            self.closed_prs
+                .sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
             self.closed_prs_map.clear();
         }
 
@@ -168,7 +171,9 @@ impl State {
 
     /// Get closed PR info by branch name
     pub fn get_closed_pr(&self, branch_name: &str) -> Option<&ClosedPrInfo> {
-        self.closed_prs.iter().find(|pr| pr.branch_name == branch_name)
+        self.closed_prs
+            .iter()
+            .find(|pr| pr.branch_name == branch_name)
     }
 }
 

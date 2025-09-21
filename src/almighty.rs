@@ -1,5 +1,6 @@
 use crate::command::CommandExecutor;
 use crate::constants::{CHANGES_BRANCH_PREFIX, DEFAULT_BASE_BRANCH, PUSH_BRANCH_PREFIX};
+use crate::edge_cases::{EdgeCaseHandler, RecoveryPlan};
 use crate::github::GitHubClient;
 use crate::jj::JujutsuClient;
 use crate::state::StateManager;
@@ -13,6 +14,7 @@ pub struct AlmightyPush {
     jj: JujutsuClient,
     github: GitHubClient,
     state: StateManager,
+    edge_handler: EdgeCaseHandler,
 }
 
 impl AlmightyPush {
@@ -23,11 +25,13 @@ impl AlmightyPush {
         github: GitHubClient,
         state: StateManager,
     ) -> Self {
+        let edge_handler = EdgeCaseHandler::new(executor.clone());
         Self {
             executor,
             jj,
             github,
             state,
+            edge_handler,
         }
     }
 
@@ -40,7 +44,11 @@ impl AlmightyPush {
             return Ok(HashMap::new());
         }
 
-        eprintln!("\nPushing {} revisions to GitHub...", revisions.len());
+        eprintln!(
+            "\nProcessing {} revision{}...",
+            revisions.len(),
+            if revisions.len() == 1 { "" } else { "s" }
+        );
 
         let existing_branches = self.github.get_existing_branches(false)?;
 
@@ -97,14 +105,18 @@ impl AlmightyPush {
                 let mut updated_rev = rev.clone();
                 updated_rev.branch_name = Some(branch_found.clone());
                 to_update.push(updated_rev);
-                eprintln!(
-                    "  Found existing branch {}: {}",
-                    rev.short_change_id(),
-                    branch_found
-                );
+                if self.executor.verbose {
+                    eprintln!(
+                        "  -> Found existing branch {}: {}",
+                        rev.short_change_id(),
+                        branch_found
+                    );
+                }
             } else {
                 to_create.push(rev.clone());
-                eprintln!("  Creating branch for {}", rev.short_change_id());
+                if self.executor.verbose {
+                    eprintln!("  -> Creating branch for {}", rev.short_change_id());
+                }
             }
         }
 
@@ -173,15 +185,22 @@ impl AlmightyPush {
             return Ok(());
         }
 
-        if created_count > 0 && updated_count > 0 {
-            eprintln!(
-                "  Created {} branches, updated {}",
-                created_count, updated_count
-            );
-        } else if created_count > 0 {
-            eprintln!("  Created {} new branches", created_count);
-        } else {
-            eprintln!("  Updated {} existing branches", updated_count);
+        if self.executor.verbose {
+            if created_count > 0 && updated_count > 0 {
+                eprintln!("  Pushed: {} new, {} updated", created_count, updated_count);
+            } else if created_count > 0 {
+                eprintln!(
+                    "  Pushed: {} new branch{}",
+                    created_count,
+                    if created_count == 1 { "" } else { "es" }
+                );
+            } else {
+                eprintln!(
+                    "  Pushed: {} updated branch{}",
+                    updated_count,
+                    if updated_count == 1 { "" } else { "es" }
+                );
+            }
         }
 
         Ok(())
@@ -193,11 +212,13 @@ impl AlmightyPush {
             return Ok(());
         }
 
-        eprintln!("\nCreating pull requests...");
+        eprintln!("\nManaging pull requests...");
 
         match self.github.repo_spec() {
             Ok(repo_spec) => {
-                eprintln!("  Repository: {}", repo_spec);
+                if self.executor.verbose {
+                    eprintln!("  Repository: {}", repo_spec);
+                }
             }
             Err(e) => {
                 eprintln!("  warning: {}", e);
@@ -225,10 +246,12 @@ impl AlmightyPush {
             };
 
             if revisions[i].branch_name.is_none() {
-                eprintln!(
-                    "  warning: cannot create PR for {}: no branch",
-                    revisions[i].short_change_id()
-                );
+                if self.executor.verbose {
+                    eprintln!(
+                        "  warning: cannot create PR for {}: no branch",
+                        revisions[i].short_change_id()
+                    );
+                }
                 continue;
             }
 
@@ -240,8 +263,12 @@ impl AlmightyPush {
 
         // Print summary
         let created_count = revisions.iter().filter(|r| r.pr_url.is_some()).count();
-        if created_count > 0 {
-            eprintln!("  Created/updated {} PRs", created_count);
+        if created_count > 0 && self.executor.verbose {
+            eprintln!(
+                "  Processed {} PR{}",
+                created_count,
+                if created_count == 1 { "" } else { "s" }
+            );
         }
 
         Ok(())
@@ -310,7 +337,7 @@ impl AlmightyPush {
         }
 
         if !issues.is_empty() {
-            eprintln!("\nwarning: PR stack verification found issues:");
+            eprintln!("\nWarning: PR stack verification issues:");
             for issue in &issues {
                 eprintln!("  - {}", issue);
             }
@@ -324,5 +351,84 @@ impl AlmightyPush {
         let local_bookmarks = self.jj.get_local_bookmarks()?;
         self.state
             .save(revisions, closed_prs, Some(&local_bookmarks))
+    }
+
+    /// Apply recovery plan actions
+    pub fn apply_recovery_plan(
+        &mut self,
+        recovery_plan: &RecoveryPlan,
+        revisions: &[Revision],
+    ) -> Result<()> {
+        if !recovery_plan.update_pr_bases.is_empty() {
+            eprintln!("\nApplying recovery plan PR base updates...");
+            self.github
+                .update_pr_bases_for_reorder(revisions, &recovery_plan.update_pr_bases)?;
+        }
+        Ok(())
+    }
+
+    /// Detect and handle edge cases before processing
+    pub fn detect_and_handle_edge_cases(&mut self, revisions: &[Revision]) -> Result<RecoveryPlan> {
+        let state = self.state.load()?;
+
+        // Detect squashed/abandoned commits
+        let squash_detection = self.edge_handler.detect_squashed_commits(&state)?;
+        if !squash_detection.orphaned_prs.is_empty() && self.executor.verbose {
+            eprintln!(
+                "\nDetected {} orphaned PRs from squashed/abandoned commits",
+                squash_detection.orphaned_prs.len()
+            );
+            for (pr_num, branch) in &squash_detection.orphaned_prs {
+                eprintln!("  - PR #{} (branch: {})", pr_num, branch);
+            }
+        }
+
+        // Analyze commit evolution (splits/merges) - splits are now disabled to avoid false positives
+        let _evolution = self.edge_handler.analyze_commit_evolution(revisions)?;
+
+        // Detect reordered commits
+        let reorder_detection = self
+            .edge_handler
+            .detect_reordered_commits(revisions, &state)?;
+        if !reorder_detection.reordered_commits.is_empty() && self.executor.verbose {
+            eprintln!(
+                "\nDetected {} reordered commits:",
+                reorder_detection.reordered_commits.len()
+            );
+            for (change_id, info) in &reorder_detection.reordered_commits {
+                eprintln!(
+                    "  - {} moved from position {} to {}",
+                    &change_id[..8.min(change_id.len())],
+                    info.old_position,
+                    info.new_position
+                );
+            }
+        }
+
+        // Validate state consistency
+        let validation = self
+            .edge_handler
+            .validate_state_consistency(&state, revisions)?;
+        if !validation.orphaned_pr_entries.is_empty() && self.executor.verbose {
+            eprintln!(
+                "\nFound {} orphaned PR entries in state",
+                validation.orphaned_pr_entries.len()
+            );
+        }
+
+        // Generate recovery plan
+        let recovery_plan = self
+            .edge_handler
+            .recover_from_issues(&validation, &reorder_detection)?;
+
+        // Execute recovery actions if needed
+        if !recovery_plan.update_pr_bases.is_empty() && self.executor.verbose {
+            eprintln!("\nUpdating PR base branches for reordered commits...");
+            for pr_num in recovery_plan.update_pr_bases.keys() {
+                eprintln!("  - Will update base for PR #{}", pr_num);
+            }
+        }
+
+        Ok(recovery_plan)
     }
 }

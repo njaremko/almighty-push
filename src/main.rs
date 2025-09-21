@@ -1,6 +1,7 @@
 mod almighty;
 mod command;
 mod constants;
+mod edge_cases;
 mod github;
 mod jj;
 mod state;
@@ -54,10 +55,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if !args.verbose {
-        eprintln!("almighty-push: pushing jj stack to GitHub");
-    } else {
-        eprintln!("almighty-push: pushing jj stack to GitHub (verbose mode)");
+    if args.verbose {
+        eprintln!("almighty-push (verbose mode)");
     }
 
     // Initialize components
@@ -70,7 +69,7 @@ fn main() -> Result<()> {
     // Run the main logic
     match run_almighty(args, &mut almighty) {
         Ok(()) => {
-            eprintln!("\nCompleted successfully");
+            eprintln!("Complete");
             Ok(())
         }
         Err(e) => {
@@ -82,18 +81,30 @@ fn main() -> Result<()> {
 
 fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
     // We need to create a new JujutsuClient for getting revisions
-    let executor = CommandExecutor::new_verbose(almighty.executor.verbose).with_dry_run(args.dry_run);
+    let executor =
+        CommandExecutor::new_verbose(almighty.executor.verbose).with_dry_run(args.dry_run);
     let jj_client = JujutsuClient::new(executor.clone());
 
     // Fetch latest changes from remote
-    eprintln!("Fetching latest changes from remote...");
+    if args.verbose {
+        eprintln!("Fetching from remote...");
+    }
     executor.run(&["jj", "git", "fetch"])?;
 
     // Get revisions in the stack
     let mut revisions = jj_client.get_revisions_above_base(DEFAULT_BASE_BRANCH)?;
 
+    // Detect and handle edge cases early (if we have revisions)
+    let recovery_plan = if !revisions.is_empty() {
+        Some(almighty.detect_and_handle_edge_cases(&revisions)?)
+    } else {
+        None
+    };
+
     if revisions.is_empty() {
-        eprintln!("No revisions to push");
+        if args.verbose {
+            eprintln!("No revisions to push");
+        }
 
         // Still check for orphaned PRs even if no new revisions
         if !args.no_pr && !args.no_close_orphaned {
@@ -109,7 +120,7 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
     }
 
     if args.dry_run {
-        eprintln!("\n[dry-run] Running in simulation mode - no changes will be made");
+        eprintln!("\n[DRY RUN] No changes will be made");
     }
 
     // Push all revisions
@@ -133,6 +144,13 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
         // Update PR bases to create proper stack
         almighty.verify_pr_bases(&revisions)?;
 
+        // Apply recovery plan if we have one
+        if let Some(recovery_plan) = &recovery_plan {
+            if !args.dry_run {
+                almighty.apply_recovery_plan(recovery_plan, &revisions)?;
+            }
+        }
+
         // Update PR titles and bodies with stack information
         almighty.update_pr_details(&revisions)?;
 
@@ -144,7 +162,7 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
 
     // Summary - PR URLs go to stdout for easy scripting
     if revisions.iter().any(|r| r.pr_url.is_some()) {
-        eprintln!("\nPull requests:");
+        eprintln!("\nPull Requests:");
         for rev in &revisions {
             if let Some(pr_url) = &rev.pr_url {
                 let pr_number = rev.extract_pr_number().unwrap_or(0);
