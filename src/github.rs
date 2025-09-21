@@ -2,7 +2,7 @@ use crate::command::CommandExecutor;
 use crate::constants::{CHANGES_BRANCH_PREFIX, DEFAULT_REMOTE, PUSH_BRANCH_PREFIX};
 use crate::jj::JujutsuClient;
 use crate::state::StateManager;
-use crate::types::{GithubPr, Revision};
+use crate::types::{GithubPr, PrInfo, Revision};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -195,12 +195,7 @@ impl GitHubClient {
             ])?;
 
             // Update state
-            let mut state = self.state_manager.load()?;
-            state.closed_prs_map.remove(branch_name);
-
-            // Save the updated state manually
-            let contents = serde_json::to_string_pretty(&state)?;
-            std::fs::write(".almighty", contents)?;
+            self.state_manager.remove_closed_pr(branch_name)?;
 
             return Ok(true);
         }
@@ -293,6 +288,15 @@ impl GitHubClient {
             &mut branches_to_delete,
         )?;
 
+        let context = OrphanedPrContext {
+            disappeared_bookmarks: &disappeared_bookmarks,
+            squashed_commits: &squashed_commits,
+            previous_prs,
+            active_change_ids: &active_change_ids,
+            local_bookmarks: &local_bookmarks,
+            active_branches: &active_branches,
+        };
+
         // Check for other orphaned PRs
         for pr in &managed_prs {
             let branch_name = &pr.head_ref_name;
@@ -303,18 +307,8 @@ impl GitHubClient {
 
             let change_id = Self::extract_change_id_from_branch(branch_name);
 
-            let (should_close, reason) = self.should_close_pr(
-                branch_name,
-                change_id.as_deref(),
-                &disappeared_bookmarks,
-                &squashed_commits,
-                previous_prs,
-                &active_change_ids,
-                &local_bookmarks,
-                &active_branches,
-            );
-
-            if should_close {
+            if let Some(reason) = Self::should_close_pr(branch_name, change_id.as_deref(), &context)
+            {
                 orphaned_prs.push((pr.clone(), reason));
                 branches_to_delete.push(branch_name.clone());
             }
@@ -422,55 +416,45 @@ impl GitHubClient {
 
     /// Extract change ID from branch name
     fn extract_change_id_from_branch(branch_name: &str) -> Option<String> {
-        if branch_name.starts_with(PUSH_BRANCH_PREFIX) {
-            Some(branch_name[PUSH_BRANCH_PREFIX.len()..].to_string())
-        } else if branch_name.starts_with(CHANGES_BRANCH_PREFIX) {
-            Some(branch_name[CHANGES_BRANCH_PREFIX.len()..].to_string())
+        if let Some(stripped) = branch_name.strip_prefix(PUSH_BRANCH_PREFIX) {
+            Some(stripped.to_string())
         } else {
-            None
+            branch_name
+                .strip_prefix(CHANGES_BRANCH_PREFIX)
+                .map(|stripped| stripped.to_string())
         }
     }
 
     /// Determine if a PR should be closed and why
     fn should_close_pr(
-        &self,
         branch_name: &str,
         change_id: Option<&str>,
-        disappeared_bookmarks: &HashSet<String>,
-        squashed_commits: &HashSet<String>,
-        previous_prs: &HashMap<String, crate::types::PrInfo>,
-        active_change_ids: &HashSet<String>,
-        local_bookmarks: &HashSet<String>,
-        active_branches: &HashSet<String>,
-    ) -> (bool, String) {
-        if disappeared_bookmarks.contains(branch_name) {
-            return (
-                true,
-                "bookmark was deleted (likely squashed or abandoned)".to_string(),
-            );
+        context: &OrphanedPrContext<'_>,
+    ) -> Option<String> {
+        if context.disappeared_bookmarks.contains(branch_name) {
+            return Some("bookmark was deleted (likely squashed or abandoned)".to_string());
         }
 
-        if let Some(change_id) = change_id {
-            if squashed_commits.contains(change_id) {
-                return (
-                    true,
-                    "squashed or abandoned according to operation log".to_string(),
-                );
-            }
+        let change_id = change_id?;
 
-            if previous_prs.contains_key(change_id) && !active_change_ids.contains(change_id) {
-                return (true, "no longer in the current stack".to_string());
-            }
-
-            if !local_bookmarks.contains(branch_name)
-                && !active_branches.contains(branch_name)
-                && !active_change_ids.contains(change_id)
-            {
-                return (true, "removed from the stack".to_string());
-            }
+        if context.squashed_commits.contains(change_id) {
+            return Some("squashed or abandoned according to operation log".to_string());
         }
 
-        (false, String::new())
+        if context.previous_prs.contains_key(change_id)
+            && !context.active_change_ids.contains(change_id)
+        {
+            return Some("no longer in the current stack".to_string());
+        }
+
+        if !context.local_bookmarks.contains(branch_name)
+            && !context.active_branches.contains(branch_name)
+            && !context.active_change_ids.contains(change_id)
+        {
+            return Some("removed from the stack".to_string());
+        }
+
+        None
     }
 
     /// Close the given PRs with explanatory comments
@@ -561,7 +545,11 @@ impl GitHubClient {
                     }
                 }
             } else {
-                eprintln!("  PR for {} is {}, skipping base update", revision.short_change_id(), pr_state);
+                eprintln!(
+                    "  PR for {} is {}, skipping base update",
+                    revision.short_change_id(),
+                    pr_state
+                );
             }
 
             revision.pr_url = Some(existing_pr.url);
@@ -705,10 +693,12 @@ impl GitHubClient {
                 };
 
                 if pr_state != "open" {
-                    eprintln!("  Skipping update for PR #{} ({}): PR is {}",
-                             rev.extract_pr_number().unwrap_or(0),
-                             rev.short_change_id(),
-                             pr_state);
+                    eprintln!(
+                        "  Skipping update for PR #{} ({}): PR is {}",
+                        rev.extract_pr_number().unwrap_or(0),
+                        rev.short_change_id(),
+                        pr_state
+                    );
                     continue;
                 }
             }
@@ -788,4 +778,13 @@ impl GitHubClient {
 
         body
     }
+}
+
+struct OrphanedPrContext<'a> {
+    disappeared_bookmarks: &'a HashSet<String>,
+    squashed_commits: &'a HashSet<String>,
+    previous_prs: &'a HashMap<String, PrInfo>,
+    active_change_ids: &'a HashSet<String>,
+    local_bookmarks: &'a HashSet<String>,
+    active_branches: &'a HashSet<String>,
 }

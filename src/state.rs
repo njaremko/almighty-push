@@ -37,8 +37,7 @@ impl StateManager {
             .with_context(|| format!("Failed to read state file: {:?}", self.state_file))?;
 
         let state = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse state file: {:?}", self.state_file))
-            .unwrap_or_default();
+            .with_context(|| format!("Failed to parse state file: {:?}", self.state_file))?;
 
         Ok(state)
     }
@@ -50,7 +49,7 @@ impl StateManager {
         closed_prs: &[(u32, String)],
         local_bookmarks: Option<&HashSet<String>>,
     ) -> Result<()> {
-        let mut state = self.load().unwrap_or_default();
+        let mut state = self.load()?;
 
         state.last_run = Some(Local::now());
 
@@ -91,12 +90,25 @@ impl StateManager {
             state.bookmarks = bookmarks.clone();
         }
 
-        let contents = serde_json::to_string_pretty(&state).context("Failed to serialize state")?;
+        self.write_state(&state)
+    }
 
-        fs::write(&self.state_file, contents)
-            .with_context(|| format!("Failed to write state file: {:?}", self.state_file))?;
+    /// Remove a closed PR entry after it has been reopened
+    pub fn remove_closed_pr(&self, branch_name: &str) -> Result<()> {
+        let mut state = self.load()?;
+
+        if state.closed_prs_map.remove(branch_name).is_some() {
+            self.write_state(&state)?;
+        }
 
         Ok(())
+    }
+
+    fn write_state(&self, state: &State) -> Result<()> {
+        let contents = serde_json::to_string_pretty(state).context("Failed to serialize state")?;
+
+        fs::write(&self.state_file, contents)
+            .with_context(|| format!("Failed to write state file: {:?}", self.state_file))
     }
 
     /// Get bookmarks that existed in the last run but don't exist now

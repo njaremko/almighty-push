@@ -1,4 +1,4 @@
-/// Constants used throughout the application
+//! Constants used throughout the application
 
 /// State file for persisting data between runs
 pub const STATE_FILE: &str = ".almighty";
