@@ -38,7 +38,9 @@ impl AlmightyPush {
     /// Rebase stack to skip over merged commits
     pub fn rebase_stack_over_merged(&mut self, revisions: &[Revision]) -> Result<bool> {
         // Find merged PRs in the stack
-        let merged_indices: Vec<usize> = revisions.iter().enumerate()
+        let merged_indices: Vec<usize> = revisions
+            .iter()
+            .enumerate()
             .filter_map(|(i, rev)| {
                 if matches!(rev.pr_state, Some(crate::types::PrState::Merged)) {
                     Some(i)
@@ -63,21 +65,31 @@ impl AlmightyPush {
             if let Some(next_idx) = next_unmerged_idx {
                 // Find the destination (parent of the merged commit or main)
                 let destination = if merged_idx == 0 {
-                    format!("{}@{}", DEFAULT_BASE_BRANCH, crate::constants::DEFAULT_REMOTE)
+                    format!(
+                        "{}@{}",
+                        DEFAULT_BASE_BRANCH,
+                        crate::constants::DEFAULT_REMOTE
+                    )
                 } else {
                     // Find the previous unmerged commit
-                    let prev_unmerged_idx = (0..merged_idx).rev()
-                        .find(|&i| !matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged)));
+                    let prev_unmerged_idx = (0..merged_idx).rev().find(|&i| {
+                        !matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged))
+                    });
 
                     if let Some(prev_idx) = prev_unmerged_idx {
                         revisions[prev_idx].change_id.clone()
                     } else {
-                        format!("{}@{}", DEFAULT_BASE_BRANCH, crate::constants::DEFAULT_REMOTE)
+                        format!(
+                            "{}@{}",
+                            DEFAULT_BASE_BRANCH,
+                            crate::constants::DEFAULT_REMOTE
+                        )
                     }
                 };
 
                 // Rebase the next unmerged commit and its descendants onto the destination
-                self.jj.rebase_revision(&revisions[next_idx].change_id, &destination)?;
+                self.jj
+                    .rebase_revision(&revisions[next_idx].change_id, &destination)?;
             }
         }
 
@@ -110,8 +122,11 @@ impl AlmightyPush {
         // Copy branch names to original revisions first so populate_pr_states can use them
         for rev in revisions.iter_mut() {
             // Find matching revision in categorized lists to get branch name
-            if let Some(categorized) = to_create.iter().chain(to_update.iter())
-                .find(|r| r.change_id == rev.change_id) {
+            if let Some(categorized) = to_create
+                .iter()
+                .chain(to_update.iter())
+                .find(|r| r.change_id == rev.change_id)
+            {
                 rev.branch_name = categorized.branch_name.clone();
             }
         }
@@ -120,11 +135,15 @@ impl AlmightyPush {
         self.github.populate_pr_states(revisions)?;
 
         // Re-categorize with updated PR states
-        let (mut to_create, mut to_update) = self.categorize_revisions(revisions, &existing_branches)?;
+        let (mut to_create, mut to_update) =
+            self.categorize_revisions(revisions, &existing_branches)?;
 
         // Copy PR states from original revisions to categorized ones
         for categorized in to_create.iter_mut().chain(to_update.iter_mut()) {
-            if let Some(original) = revisions.iter().find(|r| r.change_id == categorized.change_id) {
+            if let Some(original) = revisions
+                .iter()
+                .find(|r| r.change_id == categorized.change_id)
+            {
                 categorized.pr_state = original.pr_state;
                 categorized.pr_url = original.pr_url.clone();
                 categorized.pr_number = original.pr_number;
@@ -132,18 +151,26 @@ impl AlmightyPush {
         }
 
         // Filter out merged PRs - we don't want to push merged branches
-        let merged_count = to_create.iter().chain(to_update.iter())
+        let merged_count = to_create
+            .iter()
+            .chain(to_update.iter())
             .filter(|rev| matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
             .count();
 
         if merged_count > 0 && self.executor.verbose {
-            eprintln!("Skipping {} merged PR{}", merged_count, if merged_count == 1 { "" } else { "s" });
+            eprintln!(
+                "Skipping {} merged PR{}",
+                merged_count,
+                if merged_count == 1 { "" } else { "s" }
+            );
         }
 
-        let to_create: Vec<_> = to_create.into_iter()
+        let to_create: Vec<_> = to_create
+            .into_iter()
             .filter(|rev| !matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
             .collect();
-        let to_update: Vec<_> = to_update.into_iter()
+        let to_update: Vec<_> = to_update
+            .into_iter()
             .filter(|rev| !matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
             .collect();
 
@@ -281,8 +308,13 @@ impl AlmightyPush {
         if created_count > 0 && updated_count > 0 {
             eprintln!(
                 "Pushed {} updated, {} new branch{}",
-                updated_count, created_count,
-                if created_count + updated_count == 1 { "" } else { "es" }
+                updated_count,
+                created_count,
+                if created_count + updated_count == 1 {
+                    ""
+                } else {
+                    "es"
+                }
             );
         } else if created_count > 0 {
             eprintln!(
@@ -348,7 +380,10 @@ impl AlmightyPush {
                 // Look backwards for the first unmerged PR's branch
                 let mut base_idx = i - 1;
                 loop {
-                    if !matches!(revisions[base_idx].pr_state, Some(crate::types::PrState::Merged)) {
+                    if !matches!(
+                        revisions[base_idx].pr_state,
+                        Some(crate::types::PrState::Merged)
+                    ) {
                         // Found an unmerged PR, use its branch
                         break revisions[base_idx]
                             .branch_name
@@ -375,12 +410,18 @@ impl AlmightyPush {
 
             // Clone the revisions list to avoid borrowing issues
             let all_revisions = revisions.to_vec();
-            let (success, was_created) = self.github
-                .create_pull_request(&mut revisions[i], &base_branch, i, &all_revisions)?;
+            let (success, was_created) = self.github.create_pull_request(
+                &mut revisions[i],
+                &base_branch,
+                i,
+                &all_revisions,
+            )?;
 
             // Show PR creation/update messages
             if success && revisions[i].pr_url.is_some() {
-                let pr_number = revisions[i].pr_number.unwrap_or_else(|| revisions[i].extract_pr_number().unwrap_or(0));
+                let pr_number = revisions[i]
+                    .pr_number
+                    .unwrap_or_else(|| revisions[i].extract_pr_number().unwrap_or(0));
                 if was_created {
                     eprintln!("Created PR #{}: {}", pr_number, revisions[i].description);
                 } else {
@@ -437,7 +478,10 @@ impl AlmightyPush {
                 // Look backwards for the first unmerged PR's branch
                 let mut base_idx = i - 1;
                 loop {
-                    if !matches!(revisions[base_idx].pr_state, Some(crate::types::PrState::Merged)) {
+                    if !matches!(
+                        revisions[base_idx].pr_state,
+                        Some(crate::types::PrState::Merged)
+                    ) {
                         // Found an unmerged PR, use its branch
                         break revisions[base_idx]
                             .branch_name

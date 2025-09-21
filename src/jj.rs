@@ -521,17 +521,16 @@ impl JujutsuClient {
     /// Rebase a source revision and its descendants onto a destination
     pub fn rebase_revision(&self, source_change_id: &str, destination: &str) -> Result<()> {
         if self.executor.verbose {
-            eprintln!("  Rebasing {} and descendants onto {}", &source_change_id[..8.min(source_change_id.len())], destination);
+            eprintln!(
+                "  Rebasing {} and descendants onto {}",
+                &source_change_id[..8.min(source_change_id.len())],
+                destination
+            );
         }
 
-        let output = self.executor.run(&[
-            "jj",
-            "rebase",
-            "-s",
-            source_change_id,
-            "-d",
-            destination,
-        ])?;
+        let output =
+            self.executor
+                .run(&["jj", "rebase", "-s", source_change_id, "-d", destination])?;
 
         if self.executor.verbose && !output.stdout.is_empty() {
             eprintln!("    {}", output.stdout.trim());
@@ -700,7 +699,11 @@ impl JujutsuClient {
                         push_success = change_output.success();
 
                         // Handle case where multiple revisions have the same change ID
-                        if !push_success && change_output.stderr.contains("resolved to more than one revision") {
+                        if !push_success
+                            && change_output
+                                .stderr
+                                .contains("resolved to more than one revision")
+                        {
                             eprintln!("  warning: multiple revisions with change ID {}, using commit ID instead", rev.short_change_id());
 
                             // Try to abandon duplicate commits first
@@ -940,15 +943,15 @@ impl JujutsuClient {
                     eprintln!("  Abandoning duplicate commit: {}", &commit_id[..12]);
                 }
 
-                let abandon_output = self.executor.run_unchecked(&[
-                    "jj",
-                    "abandon",
-                    "-r",
-                    &commit_id,
-                ])?;
+                let abandon_output = self
+                    .executor
+                    .run_unchecked(&["jj", "abandon", "-r", &commit_id])?;
 
                 if !abandon_output.success() {
-                    eprintln!("  warning: failed to abandon duplicate commit {}", &commit_id[..12]);
+                    eprintln!(
+                        "  warning: failed to abandon duplicate commit {}",
+                        &commit_id[..12]
+                    );
                 }
             }
         }

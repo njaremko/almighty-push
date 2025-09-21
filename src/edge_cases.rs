@@ -288,7 +288,7 @@ pub struct EvolutionAnalysis {
     #[allow(dead_code)]
     pub merged_commits: HashMap<String, Vec<String>>, // result -> predecessors
     #[allow(dead_code)]
-    pub rewritten_commits: HashMap<String, String>,  // old -> new change ID
+    pub rewritten_commits: HashMap<String, String>, // old -> new change ID
 }
 
 /// Detection of reordered commits

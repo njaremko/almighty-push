@@ -11,7 +11,7 @@ use almighty::AlmightyPush;
 use anyhow::Result;
 use clap::Parser;
 use command::CommandExecutor;
-use constants::{DEFAULT_BASE_BRANCH, PUSH_BRANCH_PREFIX, CHANGES_BRANCH_PREFIX};
+use constants::{CHANGES_BRANCH_PREFIX, DEFAULT_BASE_BRANCH, PUSH_BRANCH_PREFIX};
 use github::GitHubClient;
 use jj::JujutsuClient;
 use state::StateManager;
@@ -223,25 +223,29 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
     }
 
     // Summary - show all PRs in the stack
-    let all_prs: Vec<&types::Revision> = revisions
-        .iter()
-        .filter(|r| r.pr_url.is_some())
-        .collect();
+    let all_prs: Vec<&types::Revision> = revisions.iter().filter(|r| r.pr_url.is_some()).collect();
 
     if !all_prs.is_empty() {
         // Count PR states
-        let open_count = all_prs.iter().filter(|r|
-            matches!(r.pr_state, Some(types::PrState::Open) | None)
-        ).count();
-        let merged_count = all_prs.iter().filter(|r|
-            matches!(r.pr_state, Some(types::PrState::Merged))
-        ).count();
-        let closed_count = all_prs.iter().filter(|r|
-            matches!(r.pr_state, Some(types::PrState::Closed))
-        ).count();
+        let open_count = all_prs
+            .iter()
+            .filter(|r| matches!(r.pr_state, Some(types::PrState::Open) | None))
+            .count();
+        let merged_count = all_prs
+            .iter()
+            .filter(|r| matches!(r.pr_state, Some(types::PrState::Merged)))
+            .count();
+        let closed_count = all_prs
+            .iter()
+            .filter(|r| matches!(r.pr_state, Some(types::PrState::Closed)))
+            .count();
 
         eprintln!();
-        let mut summary = format!("Stack: {} PR{}", all_prs.len(), if all_prs.len() == 1 { "" } else { "s" });
+        let mut summary = format!(
+            "Stack: {} PR{}",
+            all_prs.len(),
+            if all_prs.len() == 1 { "" } else { "s" }
+        );
 
         let mut parts = Vec::new();
         if open_count > 0 {
