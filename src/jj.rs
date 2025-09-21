@@ -518,6 +518,28 @@ impl JujutsuClient {
         Ok(())
     }
 
+    /// Rebase a source revision and its descendants onto a destination
+    pub fn rebase_revision(&self, source_change_id: &str, destination: &str) -> Result<()> {
+        if self.executor.verbose {
+            eprintln!("  Rebasing {} and descendants onto {}", &source_change_id[..8.min(source_change_id.len())], destination);
+        }
+
+        let output = self.executor.run(&[
+            "jj",
+            "rebase",
+            "-s",
+            source_change_id,
+            "-d",
+            destination,
+        ])?;
+
+        if self.executor.verbose && !output.stdout.is_empty() {
+            eprintln!("    {}", output.stdout.trim());
+        }
+
+        Ok(())
+    }
+
     /// Push revisions to remote using jj git push
     pub fn push_revisions(&self, revisions: &mut [Revision]) -> Result<()> {
         if revisions.is_empty() {

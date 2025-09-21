@@ -69,6 +69,8 @@ pub struct PrInfo {
     pub commit_id: String,
     pub description: String,
     pub last_seen: DateTime<Local>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_position: Option<usize>,
 }
 
 /// Information about closed PRs
@@ -107,6 +109,10 @@ pub struct State {
     #[serde(default)]
     pub closed_pr_change_ids: HashSet<String>,
 
+    /// Stack order - ordered list of change IDs from bottom to top of stack
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack_order: Vec<String>,
+
     // Legacy fields for backward compatibility (v1)
     #[serde(skip_serializing, default)]
     pub prs_map: HashMap<String, PrInfo>,
@@ -124,6 +130,7 @@ impl Default for State {
             bookmarks: Vec::new(),
             merged_pr_change_ids: HashSet::new(),
             closed_pr_change_ids: HashSet::new(),
+            stack_order: Vec::new(),
             prs_map: HashMap::new(),
             closed_prs_map: HashMap::new(),
         }
@@ -146,6 +153,7 @@ impl State {
                     commit_id: info.commit_id.clone(),
                     description: info.description.clone(),
                     last_seen: info.last_seen,
+                    stack_position: info.stack_position,
                 })
                 .collect();
             self.prs.sort_by(|a, b| a.change_id.cmp(&b.change_id));

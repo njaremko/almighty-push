@@ -185,6 +185,34 @@ impl GitHubClient {
         Ok(branches)
     }
 
+    /// Populate PR states for all revisions in the stack
+    pub fn populate_pr_states(&mut self, revisions: &mut [Revision]) -> Result<()> {
+        // Ensure PR cache is loaded
+        self.load_pr_cache()?;
+
+        for rev in revisions.iter_mut() {
+            if let Some(branch_name) = &rev.branch_name {
+                // Check cache for existing PR
+                if let Some(cache) = &self.pr_cache {
+                    if let Some(pr) = cache.get(branch_name) {
+                        // Set PR state based on what we found
+                        let pr_state = pr.state.to_lowercase();
+                        rev.pr_state = match pr_state.as_str() {
+                            "merged" => Some(crate::types::PrState::Merged),
+                            "closed" => Some(crate::types::PrState::Closed),
+                            "open" | "" => Some(crate::types::PrState::Open),
+                            _ => Some(crate::types::PrState::Open),
+                        };
+                        rev.pr_url = Some(pr.url.clone());
+                        rev.pr_number = Some(pr.number);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Check if a PR was previously closed and reopen it if needed
     pub fn reopen_pr_if_needed(&mut self, branch_name: &str) -> Result<bool> {
         let state = self.state_manager.load()?;
@@ -497,17 +525,17 @@ impl GitHubClient {
         }
 
         eprintln!(
-            "\n  Found {} merged PR{} with local bookmarks:",
+            "\nFound {} merged PR{} with local bookmarks:",
             merged_bookmarks.len(),
             if merged_bookmarks.len() == 1 { "" } else { "s" }
         );
 
         for (pr_number, branch_name) in &merged_bookmarks {
-            eprintln!("    PR #{} ({})", pr_number, branch_name);
+            eprintln!("  PR #{} ({})", pr_number, branch_name);
         }
 
         if delete_branches {
-            eprintln!("  Deleting merged PR bookmarks...");
+            eprintln!("Deleting merged PR bookmarks...");
             let bookmarks_to_delete: Vec<String> = merged_bookmarks
                 .iter()
                 .map(|(_, branch)| branch.clone())
@@ -527,7 +555,7 @@ impl GitHubClient {
                 );
             }
         } else {
-            eprintln!("    (use --delete-branches to remove merged bookmarks)");
+            eprintln!("  (use --delete-branches to remove merged bookmarks)");
         }
 
         Ok(())
@@ -743,19 +771,20 @@ impl GitHubClient {
     }
 
     /// Create or update a pull request for a revision
+    /// Returns (success, was_created) where was_created is true if a new PR was created
     pub fn create_pull_request(
         &mut self,
         revision: &mut Revision,
         base_branch: &str,
         stack_position: usize,
         all_revisions: &[Revision],
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         if revision.branch_name.is_none() {
             eprintln!(
                 "  warning: skipping {}: no branch name",
                 revision.short_change_id()
             );
-            return Ok(false);
+            return Ok((false, false));
         }
 
         let branch_name = revision.branch_name.as_ref().unwrap();
@@ -771,7 +800,7 @@ impl GitHubClient {
                     revision.short_change_id()
                 );
             }
-            return Ok(true);
+            return Ok((true, false));
         }
 
         if state.closed_pr_change_ids.contains(&revision.change_id) {
@@ -783,7 +812,7 @@ impl GitHubClient {
                     revision.short_change_id()
                 );
             }
-            return Ok(true);
+            return Ok((true, false));
         }
 
         // Check cache first
@@ -822,19 +851,22 @@ impl GitHubClient {
             if pr_state == "merged" || pr_state == "closed" {
                 revision.pr_url = Some(existing_pr.url);
                 revision.pr_number = Some(existing_pr.number);
-                return Ok(true);
+                return Ok((true, false));
             }
 
             // Only update base if PR is open
             if let Some(current_base) = existing_pr.base_ref_name {
                 if current_base != base_branch {
+                    if self.executor.verbose {
+                        eprintln!("  PR base needs update: {} -> {}", current_base, base_branch);
+                    }
                     self.update_pr_base(branch_name, base_branch)?;
                 }
             }
 
             revision.pr_url = Some(existing_pr.url);
             revision.pr_number = Some(existing_pr.number);
-            return Ok(true);
+            return Ok((true, false));
         }
 
         // Create new PR
@@ -862,8 +894,7 @@ impl GitHubClient {
             let pr_url = output.stdout.trim().to_string();
             revision.pr_url = Some(pr_url.clone());
             revision.pr_state = Some(crate::types::PrState::Open);
-            eprintln!("  Created PR for {}", revision.short_change_id());
-            Ok(true)
+            Ok((true, true))
         } else {
             eprintln!(
                 "  error: failed to create PR for {}",
@@ -872,7 +903,7 @@ impl GitHubClient {
             if !output.stderr.is_empty() {
                 eprintln!("         {}", output.stderr);
             }
-            Ok(false)
+            Ok((false, false))
         }
     }
 
@@ -921,12 +952,12 @@ impl GitHubClient {
         ])?;
 
         if !output.success() {
-            eprintln!("    warning: failed to update PR base to {}", new_base);
+            eprintln!("  warning: failed to update PR base to {}", new_base);
             if !output.stderr.is_empty() {
-                eprintln!("             {}", output.stderr);
+                eprintln!("           {}", output.stderr);
             }
-        } else {
-            eprintln!("    Successfully updated PR base to {}", new_base);
+        } else if self.executor.verbose {
+            eprintln!("  Successfully updated PR base to {}", new_base);
         }
 
         Ok(())
@@ -1028,7 +1059,14 @@ impl GitHubClient {
 
         for (i, rev) in all_revisions.iter().enumerate() {
             let prefix = if i == position { "→ " } else { "  " };
-            body.push_str(&format!("{} {}. {}\n", prefix, i + 1, rev.description));
+            let state_marker = match &rev.pr_state {
+                Some(crate::types::PrState::Merged) => " ✓",
+                Some(crate::types::PrState::Closed) => " ✗",
+                Some(crate::types::PrState::Open) if rev.pr_url.is_some() => "",
+                _ if rev.pr_url.is_some() => "",
+                _ => " (no PR)",
+            };
+            body.push_str(&format!("{} {}. {}{}\n", prefix, i + 1, rev.description, state_marker));
         }
 
         body.push_str(&format!("\nChange ID: `{}`\n", revision.change_id));
@@ -1052,17 +1090,13 @@ impl GitHubClient {
 
             let branch_name = rev.branch_name.as_ref().unwrap();
 
-            // Check if PR is open before updating
-            if let Some(existing_pr) = self.get_existing_pr(branch_name)? {
-                let pr_state = if existing_pr.state.is_empty() {
-                    "open".to_string()
-                } else {
-                    existing_pr.state.to_lowercase()
-                };
-
-                if pr_state != "open" {
-                    continue;
+            // Skip updating merged PRs (GitHub won't allow it)
+            // But DO update open and closed PRs to reflect current stack state
+            if matches!(rev.pr_state, Some(crate::types::PrState::Merged)) {
+                if self.executor.verbose {
+                    eprintln!("  Skipping update for merged PR #{}", rev.pr_number.unwrap_or(0));
                 }
+                continue;
             }
 
             let body = self.build_full_pr_body(rev, i, revisions);
@@ -1081,10 +1115,7 @@ impl GitHubClient {
                 &body,
             ])?;
 
-            if output.success() {
-                let pr_number = rev.extract_pr_number().unwrap_or(0);
-                eprintln!("  Updated PR #{} for {}", pr_number, rev.short_change_id());
-            } else {
+            if !output.success() {
                 eprintln!(
                     "  warning: failed to update PR for {}",
                     rev.short_change_id()
@@ -1113,9 +1144,15 @@ impl GitHubClient {
             if r.pr_url.is_some() {
                 let marker = if j == position { "→" } else { "  " };
                 let pr_number = r.extract_pr_number().unwrap_or(0);
+                let state_marker = match &r.pr_state {
+                    Some(crate::types::PrState::Merged) => " ✓",
+                    Some(crate::types::PrState::Closed) => " ✗",
+                    Some(crate::types::PrState::Open) => "",
+                    _ => "",
+                };
                 body.push_str(&format!(
-                    "{} **#{}**: {}\n",
-                    marker, pr_number, r.description
+                    "{} **#{}**: {}{}\n",
+                    marker, pr_number, r.description, state_marker
                 ));
             }
         }

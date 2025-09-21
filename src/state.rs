@@ -122,6 +122,7 @@ impl StateManager {
                     commit_id: pr_v1.commit_id,
                     description: pr_v1.description,
                     last_seen: pr_v1.last_seen,
+                    stack_position: None,
                 });
             }
         }
@@ -202,9 +203,14 @@ impl StateManager {
         state.version = STATE_VERSION;
         state.last_run = Some(Local::now());
 
-        // Save PR state as a sorted list
+        // Save PR state preserving stack order
         state.prs.clear();
-        for rev in revisions {
+        state.stack_order.clear();
+
+        for (i, rev) in revisions.iter().enumerate() {
+            // Track all revisions in stack order
+            state.stack_order.push(rev.change_id.clone());
+
             if let Some(pr_url) = &rev.pr_url {
                 state.prs.push(PrInfo {
                     change_id: rev.change_id.clone(),
@@ -214,11 +220,11 @@ impl StateManager {
                     commit_id: rev.commit_id.clone(),
                     description: rev.description.clone(),
                     last_seen: Local::now(),
+                    stack_position: Some(i),
                 });
             }
         }
-        // Sort for consistent ordering
-        state.prs.sort_by(|a, b| a.change_id.cmp(&b.change_id));
+        // Keep PRs in stack order (no sorting)
 
         // Track closed PRs as a sorted list
         if !closed_prs.is_empty() {

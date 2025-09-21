@@ -35,6 +35,56 @@ impl AlmightyPush {
         }
     }
 
+    /// Rebase stack to skip over merged commits
+    pub fn rebase_stack_over_merged(&mut self, revisions: &[Revision]) -> Result<bool> {
+        // Find merged PRs in the stack
+        let merged_indices: Vec<usize> = revisions.iter().enumerate()
+            .filter_map(|(i, rev)| {
+                if matches!(rev.pr_state, Some(crate::types::PrState::Merged)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if merged_indices.is_empty() {
+            return Ok(false);
+        }
+
+        eprintln!("Rebasing stack to skip merged commits...");
+
+        // Process merged commits from bottom to top
+        for &merged_idx in &merged_indices {
+            // Find the next unmerged commit above this one
+            let next_unmerged_idx = ((merged_idx + 1)..revisions.len())
+                .find(|&i| !matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged)));
+
+            if let Some(next_idx) = next_unmerged_idx {
+                // Find the destination (parent of the merged commit or main)
+                let destination = if merged_idx == 0 {
+                    format!("{}@{}", DEFAULT_BASE_BRANCH, crate::constants::DEFAULT_REMOTE)
+                } else {
+                    // Find the previous unmerged commit
+                    let prev_unmerged_idx = (0..merged_idx).rev()
+                        .find(|&i| !matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged)));
+
+                    if let Some(prev_idx) = prev_unmerged_idx {
+                        revisions[prev_idx].change_id.clone()
+                    } else {
+                        format!("{}@{}", DEFAULT_BASE_BRANCH, crate::constants::DEFAULT_REMOTE)
+                    }
+                };
+
+                // Rebase the next unmerged commit and its descendants onto the destination
+                self.jj.rebase_revision(&revisions[next_idx].change_id, &destination)?;
+            }
+        }
+
+        // After rebasing, we need to refresh the revision list
+        Ok(true)
+    }
+
     /// Push all revisions to GitHub and return existing branches
     pub fn push_revisions(
         &mut self,
@@ -44,16 +94,59 @@ impl AlmightyPush {
             return Ok(HashMap::new());
         }
 
-        eprintln!(
-            "\nPushing {} revision{} to GitHub...",
-            revisions.len(),
-            if revisions.len() == 1 { "" } else { "s" }
-        );
+        if self.executor.verbose {
+            eprintln!(
+                "\nPushing {} revision{} to GitHub...",
+                revisions.len(),
+                if revisions.len() == 1 { "" } else { "s" }
+            );
+        }
 
         let existing_branches = self.github.get_existing_branches(false)?;
 
-        // Categorize revisions
+        // Categorize revisions (this assigns branch names)
         let (to_create, to_update) = self.categorize_revisions(revisions, &existing_branches)?;
+
+        // Copy branch names to original revisions first so populate_pr_states can use them
+        for rev in revisions.iter_mut() {
+            // Find matching revision in categorized lists to get branch name
+            if let Some(categorized) = to_create.iter().chain(to_update.iter())
+                .find(|r| r.change_id == rev.change_id) {
+                rev.branch_name = categorized.branch_name.clone();
+            }
+        }
+
+        // Now populate PR states (requires branch names to work)
+        self.github.populate_pr_states(revisions)?;
+
+        // Re-categorize with updated PR states
+        let (mut to_create, mut to_update) = self.categorize_revisions(revisions, &existing_branches)?;
+
+        // Copy PR states from original revisions to categorized ones
+        for categorized in to_create.iter_mut().chain(to_update.iter_mut()) {
+            if let Some(original) = revisions.iter().find(|r| r.change_id == categorized.change_id) {
+                categorized.pr_state = original.pr_state;
+                categorized.pr_url = original.pr_url.clone();
+                categorized.pr_number = original.pr_number;
+            }
+        }
+
+        // Filter out merged PRs - we don't want to push merged branches
+        let merged_count = to_create.iter().chain(to_update.iter())
+            .filter(|rev| matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
+            .count();
+
+        if merged_count > 0 && self.executor.verbose {
+            eprintln!("Skipping {} merged PR{}", merged_count, if merged_count == 1 { "" } else { "s" });
+        }
+
+        let to_create: Vec<_> = to_create.into_iter()
+            .filter(|rev| !matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
+            .collect();
+        let to_update: Vec<_> = to_update.into_iter()
+            .filter(|rev| !matches!(rev.pr_state, Some(crate::types::PrState::Merged)))
+            .collect();
+
         let created_count = to_create.len();
         let updated_count = to_update.len();
 
@@ -61,12 +154,12 @@ impl AlmightyPush {
         let mut updated_to_update = to_update;
         self.check_pr_reopening(revisions, &existing_branches, &mut updated_to_update)?;
 
-        // Combine the lists back for pushing
+        // Combine the lists back for pushing (excludes merged PRs)
         let mut all_revisions = Vec::new();
         all_revisions.extend(to_create);
         all_revisions.extend(updated_to_update);
 
-        // Push branches
+        // Push branches (only non-merged)
         self.jj.push_revisions(&mut all_revisions)?;
 
         // Copy updated branch names back to original revisions using change-id lookup
@@ -187,18 +280,19 @@ impl AlmightyPush {
 
         if created_count > 0 && updated_count > 0 {
             eprintln!(
-                "  Pushed: {} new, {} updated branches",
-                created_count, updated_count
+                "Pushed {} updated, {} new branch{}",
+                updated_count, created_count,
+                if created_count + updated_count == 1 { "" } else { "es" }
             );
         } else if created_count > 0 {
             eprintln!(
-                "  Pushed: {} new branch{}",
+                "Pushed {} new branch{}",
                 created_count,
                 if created_count == 1 { "" } else { "es" }
             );
         } else {
             eprintln!(
-                "  Pushed: {} updated branch{}",
+                "Pushed {} updated branch{}",
                 updated_count,
                 if updated_count == 1 { "" } else { "es" }
             );
@@ -213,7 +307,9 @@ impl AlmightyPush {
             return Ok(());
         }
 
-        eprintln!("\nManaging pull requests...");
+        if self.executor.verbose {
+            eprintln!("\nManaging pull requests...");
+        }
 
         match self.github.repo_spec() {
             Ok(repo_spec) => {
@@ -222,14 +318,19 @@ impl AlmightyPush {
                 }
             }
             Err(e) => {
-                eprintln!("  warning: {}", e);
-                eprintln!("  Cannot create PRs without repository information");
+                if self.executor.verbose {
+                    eprintln!("  warning: {}", e);
+                    eprintln!("  Cannot create PRs without repository information");
+                }
                 return Ok(());
             }
         }
 
         // Load PR cache to efficiently check for existing PRs
         self.github.load_pr_cache()?;
+
+        // Re-populate PR states to ensure we have the latest merged/closed status
+        self.github.populate_pr_states(revisions)?;
 
         // Check for PRs to reopen
         for rev in revisions.iter() {
@@ -240,13 +341,26 @@ impl AlmightyPush {
 
         // Create/update PRs
         for i in 0..revisions.len() {
+            // Find the appropriate base branch, skipping over merged PRs
             let base_branch = if i == 0 {
                 DEFAULT_BASE_BRANCH.to_string()
             } else {
-                revisions[i - 1]
-                    .branch_name
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string())
+                // Look backwards for the first unmerged PR's branch
+                let mut base_idx = i - 1;
+                loop {
+                    if !matches!(revisions[base_idx].pr_state, Some(crate::types::PrState::Merged)) {
+                        // Found an unmerged PR, use its branch
+                        break revisions[base_idx]
+                            .branch_name
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string());
+                    }
+                    if base_idx == 0 {
+                        // All previous PRs are merged, use main
+                        break DEFAULT_BASE_BRANCH.to_string();
+                    }
+                    base_idx -= 1;
+                }
             };
 
             if revisions[i].branch_name.is_none() {
@@ -259,44 +373,24 @@ impl AlmightyPush {
                 continue;
             }
 
-            // Track if this revision already had a PR
-            let had_pr = revisions[i].pr_url.is_some();
-
             // Clone the revisions list to avoid borrowing issues
             let all_revisions = revisions.to_vec();
-            self.github
+            let (success, was_created) = self.github
                 .create_pull_request(&mut revisions[i], &base_branch, i, &all_revisions)?;
 
-            // Count created vs updated
-            if revisions[i].pr_url.is_some() {
-                if had_pr {
-                    eprintln!(
-                        "  -> Updated PR #{}: {}",
-                        revisions[i].pr_number.unwrap_or(0),
-                        revisions[i].description
-                    );
+            // Show PR creation/update messages
+            if success && revisions[i].pr_url.is_some() {
+                let pr_number = revisions[i].pr_number.unwrap_or_else(|| revisions[i].extract_pr_number().unwrap_or(0));
+                if was_created {
+                    eprintln!("Created PR #{}: {}", pr_number, revisions[i].description);
                 } else {
-                    eprintln!(
-                        "  -> Created PR #{}: {}",
-                        revisions[i].pr_number.unwrap_or(0),
-                        revisions[i].description
-                    );
+                    eprintln!("Updated PR #{}: {}", pr_number, revisions[i].description);
                 }
                 // Always show the PR URL
                 if let Some(pr_url) = &revisions[i].pr_url {
-                    eprintln!("     {}", pr_url);
+                    eprintln!("  {}", pr_url);
                 }
             }
-        }
-
-        // Print summary
-        let pr_count = revisions.iter().filter(|r| r.pr_url.is_some()).count();
-        if pr_count > 0 {
-            eprintln!(
-                "  Processed {} PR{}",
-                pr_count,
-                if pr_count == 1 { "" } else { "s" }
-            );
         }
 
         Ok(())
@@ -314,7 +408,9 @@ impl AlmightyPush {
     }
 
     /// Update PR titles and bodies with stack information
-    pub fn update_pr_details(&mut self, revisions: &[Revision]) -> Result<()> {
+    pub fn update_pr_details(&mut self, revisions: &mut [Revision]) -> Result<()> {
+        // First populate PR states for all revisions to ensure accurate state annotations
+        self.github.populate_pr_states(revisions)?;
         self.github.update_pr_details(revisions)
     }
 
@@ -334,13 +430,26 @@ impl AlmightyPush {
                 continue;
             }
 
+            // Find expected base, skipping over merged PRs
             let expected_base = if i == 0 {
                 DEFAULT_BASE_BRANCH.to_string()
             } else {
-                revisions[i - 1]
-                    .branch_name
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string())
+                // Look backwards for the first unmerged PR's branch
+                let mut base_idx = i - 1;
+                loop {
+                    if !matches!(revisions[base_idx].pr_state, Some(crate::types::PrState::Merged)) {
+                        // Found an unmerged PR, use its branch
+                        break revisions[base_idx]
+                            .branch_name
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string());
+                    }
+                    if base_idx == 0 {
+                        // All previous PRs are merged, use main
+                        break DEFAULT_BASE_BRANCH.to_string();
+                    }
+                    base_idx -= 1;
+                }
             };
 
             let branch_name = revisions[i].branch_name.as_ref().unwrap();
