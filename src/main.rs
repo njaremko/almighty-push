@@ -153,7 +153,20 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
         github_client.populate_pr_states(&mut revisions)?;
     }
 
-    // Check if we need to rebase to skip merged commits
+    // Sync any squash-merged PRs from GitHub to local jj state
+    let did_sync = almighty.sync_squash_merged_prs(&mut revisions)?;
+
+    if did_sync {
+        // Refresh the revision list after syncing
+        revisions = jj_client.get_revisions_above_base(DEFAULT_BASE_BRANCH)?;
+
+        // Re-populate PR states after refresh
+        let mut github_client = GitHubClient::new(executor.clone(), StateManager::new());
+        github_client.load_pr_cache()?;
+        github_client.populate_pr_states(&mut revisions)?;
+    }
+
+    // Handle merged PRs in the stack by fetching and rebasing
     let did_rebase = almighty.rebase_stack_over_merged(&revisions)?;
 
     if did_rebase {

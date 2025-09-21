@@ -518,6 +518,82 @@ impl JujutsuClient {
         Ok(())
     }
 
+    /// Squash a source commit into a target commit
+    pub fn squash_commit(&self, source_change_id: &str, target_change_id: &str) -> Result<()> {
+        if self.executor.verbose {
+            eprintln!(
+                "      Running: jj squash -r {} --into {}",
+                source_change_id, target_change_id
+            );
+        }
+
+        let output = self.executor.run(&[
+            "jj",
+            "squash",
+            "-r",
+            source_change_id,
+            "--into",
+            target_change_id,
+        ])?;
+
+        if output.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Failed to squash {} into {}: {}",
+                source_change_id,
+                target_change_id,
+                output.stderr
+            )
+        }
+    }
+
+    /// Check if a commit has conflicts
+    pub fn has_conflicts(&self, change_id: &str) -> Result<bool> {
+        let output = self.executor.run_unchecked(&[
+            "jj",
+            "log",
+            "--no-graph",
+            "-r",
+            change_id,
+            "--color=never",
+            "-T",
+            "conflict",
+        ])?;
+
+        if !output.success() {
+            return Ok(false);
+        }
+
+        // If the output contains "true", there are conflicts
+        Ok(output.stdout.trim() == "true")
+    }
+
+    /// Get list of conflicted files in a revision
+    pub fn get_conflicted_files(&self, change_id: &str) -> Result<Vec<String>> {
+        let output = self.executor.run_unchecked(&[
+            "jj",
+            "resolve",
+            "--list",
+            "-r",
+            change_id,
+        ])?;
+
+        if !output.success() {
+            return Ok(Vec::new());
+        }
+
+        let files: Vec<String> = output
+            .stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        Ok(files)
+    }
+
+
     /// Rebase a source revision and its descendants onto a destination
     pub fn rebase_revision(&self, source_change_id: &str, destination: &str) -> Result<()> {
         if self.executor.verbose {
@@ -540,10 +616,62 @@ impl JujutsuClient {
         Ok(())
     }
 
+    /// Rebase with conflict detection
+    pub fn rebase_with_conflict_check(
+        &self,
+        source_change_id: &str,
+        destination: &str,
+    ) -> Result<bool> {
+        // Perform the rebase
+        self.rebase_revision(source_change_id, destination)?;
+
+        // Check if the rebased commit has conflicts
+        if self.has_conflicts(source_change_id)? {
+            let conflicted_files = self.get_conflicted_files(source_change_id)?;
+            eprintln!("\n⚠️  Conflicts detected after rebase!");
+            eprintln!("  Conflicted files:");
+            for file in &conflicted_files {
+                eprintln!("    - {}", file);
+            }
+            eprintln!("\n  To resolve:");
+            eprintln!("    1. Run: jj new {}", source_change_id);
+            eprintln!("    2. Resolve conflicts using: jj resolve");
+            eprintln!("    3. Squash the resolution: jj squash");
+            eprintln!("    4. Re-run almighty-push");
+            return Ok(true); // Has conflicts
+        }
+
+        Ok(false) // No conflicts
+    }
+
     /// Push revisions to remote using jj git push
     pub fn push_revisions(&self, revisions: &mut [Revision]) -> Result<()> {
         if revisions.is_empty() {
             return Ok(());
+        }
+
+        // First check for any conflicts in the revisions
+        let conflicted: Vec<&Revision> = revisions
+            .iter()
+            .filter(|rev| self.has_conflicts(&rev.change_id).unwrap_or(false))
+            .collect();
+
+        if !conflicted.is_empty() {
+            eprintln!("\n⚠️  Cannot push: The following commits have unresolved conflicts:");
+            for rev in &conflicted {
+                eprintln!("  - {} ({})", rev.description, rev.short_change_id());
+                if let Ok(files) = self.get_conflicted_files(&rev.change_id) {
+                    for file in files {
+                        eprintln!("      {}", file);
+                    }
+                }
+            }
+            eprintln!("\nTo resolve conflicts:");
+            eprintln!("  1. Run: jj new {}", conflicted[0].change_id);
+            eprintln!("  2. Resolve conflicts using: jj resolve");
+            eprintln!("  3. Squash the resolution: jj squash");
+            eprintln!("  4. Re-run almighty-push\n");
+            anyhow::bail!("Cannot push commits with conflicts");
         }
 
         let (to_create, to_update): (Vec<_>, Vec<_>) = revisions
@@ -699,8 +827,14 @@ impl JujutsuClient {
 
                         push_success = change_output.success();
 
+                        // Handle conflict error specifically
+                        if !push_success && change_output.stderr.contains("has conflicts") {
+                            eprintln!("  error: {} has conflicts", rev.short_change_id());
+                            eprintln!("         Run 'jj resolve -r {}' to resolve", rev.change_id);
+                            anyhow::bail!("Cannot push commits with conflicts");
+                        }
                         // Handle case where multiple revisions have the same change ID
-                        if !push_success && change_output.stderr.contains("resolved to more than one revision") {
+                        else if !push_success && change_output.stderr.contains("resolved to more than one revision") {
                             eprintln!("  warning: multiple revisions with change ID {}, using commit ID instead", rev.short_change_id());
 
                             // Try to abandon duplicate commits first

@@ -35,6 +35,173 @@ impl AlmightyPush {
         }
     }
 
+    /// Detect and sync squash-merged PRs from GitHub
+    pub fn sync_squash_merged_prs(&mut self, revisions: &mut [Revision]) -> Result<bool> {
+        // Load PR cache to get latest state from GitHub
+        self.github.load_pr_cache()?;
+
+        // Populate PR states to get current merged status
+        self.github.populate_pr_states(revisions)?;
+
+        // Find PRs that were squash-merged together
+        let squash_groups = self.find_squash_merged_groups(revisions)?;
+
+        if squash_groups.is_empty() {
+            return Ok(false);
+        }
+
+        eprintln!("\nDetected squash-merged PRs on GitHub. Syncing local jj state...");
+
+        // Apply squashes in jj to match GitHub
+        for group in squash_groups {
+            self.apply_squash_merge(&group, revisions)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Find groups of commits that were squash-merged together on GitHub
+    fn find_squash_merged_groups(
+        &mut self,
+        revisions: &[Revision],
+    ) -> Result<Vec<SquashMergeGroup>> {
+        let mut groups = Vec::new();
+
+        // Strategy 1: Look for closed PRs followed by merged PRs (typical squash-merge pattern)
+        for i in 1..revisions.len() {
+            if matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged)) {
+                // Check if the previous commit's PR is closed (indicating it was squashed into this one)
+                if matches!(
+                    revisions[i - 1].pr_state,
+                    Some(crate::types::PrState::Closed)
+                ) {
+                    // Also check if they have consecutive PR numbers or were created close together
+                    // This helps confirm they were part of the same stack
+                    if self.are_related_prs(&revisions[i - 1], &revisions[i]) {
+                        groups.push(SquashMergeGroup {
+                            target_index: i,
+                            squashed_indices: vec![i - 1],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Strategy 2: Look for multiple consecutive closed PRs followed by a merged PR
+        // This handles cases where multiple commits were squashed together
+        for i in 0..revisions.len() {
+            if matches!(revisions[i].pr_state, Some(crate::types::PrState::Merged)) {
+                let mut squashed_commits = Vec::new();
+
+                // Look backwards for consecutive closed PRs
+                for j in (0..i).rev() {
+                    if matches!(revisions[j].pr_state, Some(crate::types::PrState::Closed)) {
+                        // Check if this is consecutive with what we've already found
+                        if j == i - 1
+                            || (!squashed_commits.is_empty()
+                                && j == *squashed_commits.last().unwrap() - 1)
+                        {
+                            squashed_commits.push(j);
+                        } else {
+                            break;
+                        }
+                    } else if !matches!(revisions[j].pr_state, Some(crate::types::PrState::Merged))
+                    {
+                        // Stop if we hit an open PR or no PR
+                        break;
+                    }
+                }
+
+                if squashed_commits.len() > 1 {
+                    squashed_commits.reverse(); // Put in ascending order
+                                                // Only add if we haven't already handled this as a single squash
+                    if !groups
+                        .iter()
+                        .any(|g| g.target_index == i && g.squashed_indices.len() == 1)
+                    {
+                        groups.push(SquashMergeGroup {
+                            target_index: i,
+                            squashed_indices: squashed_commits,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Strategy 3: Check GitHub merge commit messages for evidence of squash-merges
+        // GitHub often adds "(#PR)" to the merge commit message
+        // This would require fetching more PR details, so leaving as future enhancement
+
+        Ok(groups)
+    }
+
+    /// Check if two PRs are likely related (part of the same stack)
+    fn are_related_prs(&self, pr1: &Revision, pr2: &Revision) -> bool {
+        // If they have consecutive PR numbers, they're likely related
+        if let (Some(num1), Some(num2)) = (pr1.pr_number, pr2.pr_number) {
+            if num2 == num1 + 1 || num1 == num2 + 1 {
+                return true;
+            }
+        }
+
+        // If they have the same base branch pattern, they're likely related
+        // (e.g., both targeting branches in the stack)
+        true // For now, assume consecutive commits in the stack are related
+    }
+
+    /// Apply a squash merge locally in jj to match GitHub
+    fn apply_squash_merge(
+        &mut self,
+        group: &SquashMergeGroup,
+        revisions: &[Revision],
+    ) -> Result<()> {
+        let target_rev = &revisions[group.target_index];
+
+        eprintln!(
+            "  Squashing {} commit{} into '{}'...",
+            group.squashed_indices.len(),
+            if group.squashed_indices.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            target_rev.description
+        );
+
+        // Collect bookmarks to delete
+        let mut bookmarks_to_delete = Vec::new();
+
+        // Squash each commit into the target
+        for &idx in &group.squashed_indices {
+            let source_rev = &revisions[idx];
+            eprintln!(
+                "    - Squashing '{}' ({})",
+                source_rev.description,
+                source_rev.short_change_id()
+            );
+
+            // Use jj squash to combine the commits
+            self.jj
+                .squash_commit(&source_rev.change_id, &target_rev.change_id)?;
+
+            // Collect bookmark for deletion
+            if let Some(branch_name) = &source_rev.branch_name {
+                bookmarks_to_delete.push(branch_name.clone());
+            }
+        }
+
+        // Delete bookmarks for squashed commits
+        if !bookmarks_to_delete.is_empty() {
+            eprintln!("    Cleaning up bookmarks for squashed commits...");
+            if self.jj.delete_local_bookmarks(&bookmarks_to_delete)? {
+                // Push bookmark deletions to remote
+                self.jj.push_deleted_bookmarks()?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Rebase stack to skip over merged commits
     pub fn rebase_stack_over_merged(&mut self, revisions: &[Revision]) -> Result<bool> {
         // Find merged PRs in the stack
@@ -76,8 +243,12 @@ impl AlmightyPush {
                     }
                 };
 
-                // Rebase the next unmerged commit and its descendants onto the destination
-                self.jj.rebase_revision(&revisions[next_idx].change_id, &destination)?;
+                // Use rebase with conflict checking
+                if self.jj.rebase_with_conflict_check(&revisions[next_idx].change_id, &destination)? {
+                    eprintln!("\n❌ Cannot continue due to conflicts.");
+                    eprintln!("Please resolve the conflicts and then re-run almighty-push.");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -575,4 +746,10 @@ impl AlmightyPush {
 
         Ok(recovery_plan)
     }
+}
+
+/// Represents a group of commits that were squash-merged together
+struct SquashMergeGroup {
+    target_index: usize,          // The index of the commit that received the squash
+    squashed_indices: Vec<usize>, // Indices of commits that were squashed into it
 }
