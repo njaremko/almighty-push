@@ -314,6 +314,13 @@ impl GitHubClient {
             }
         }
 
+        self.handle_merged_pr_bookmarks(
+            jj_client,
+            previous_prs,
+            &local_bookmarks,
+            delete_branches,
+        )?;
+
         if orphaned_prs.is_empty() {
             if !branches_to_delete.is_empty() {
                 eprintln!(
@@ -345,6 +352,121 @@ impl GitHubClient {
         }
 
         Ok(closed_pr_info)
+    }
+
+    fn handle_merged_pr_bookmarks(
+        &mut self,
+        jj_client: &JujutsuClient,
+        previous_prs: &HashMap<String, crate::types::PrInfo>,
+        local_bookmarks: &HashSet<String>,
+        delete_branches: bool,
+    ) -> Result<()> {
+        if previous_prs.is_empty() || local_bookmarks.is_empty() {
+            return Ok(());
+        }
+
+        let merged_prs = self.get_managed_prs_by_state("merged")?;
+        if merged_prs.is_empty() {
+            return Ok(());
+        }
+
+        let managed_branches: HashSet<String> = previous_prs
+            .values()
+            .map(|info| info.branch_name.clone())
+            .collect();
+
+        if managed_branches.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen_branches = HashSet::new();
+        let mut merged_bookmarks = Vec::new();
+
+        for pr in merged_prs {
+            let branch_name = pr.head_ref_name;
+
+            if !managed_branches.contains(&branch_name) {
+                continue;
+            }
+
+            if !local_bookmarks.contains(&branch_name) {
+                continue;
+            }
+
+            if !seen_branches.insert(branch_name.clone()) {
+                continue;
+            }
+
+            merged_bookmarks.push((pr.number, branch_name));
+        }
+
+        if merged_bookmarks.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "\n  Found {} merged PR{} with local bookmarks:",
+            merged_bookmarks.len(),
+            if merged_bookmarks.len() == 1 { "" } else { "s" }
+        );
+
+        for (pr_number, branch_name) in &merged_bookmarks {
+            eprintln!("    PR #{} ({})", pr_number, branch_name);
+        }
+
+        if delete_branches {
+            let bookmarks_to_delete: Vec<String> = merged_bookmarks
+                .iter()
+                .map(|(_, branch)| branch.clone())
+                .collect();
+
+            if jj_client.delete_local_bookmarks(&bookmarks_to_delete)? {
+                jj_client.push_deleted_bookmarks()?;
+            }
+        } else {
+            eprintln!("    (use --delete-branches to remove merged bookmarks)");
+        }
+
+        Ok(())
+    }
+
+    fn get_managed_prs_by_state(&mut self, state: &str) -> Result<Vec<GithubPr>> {
+        let repo_spec = match self.repo_spec() {
+            Ok(spec) => spec,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let output = self.executor.run_unchecked(&[
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            &repo_spec,
+            "--state",
+            state,
+            "--json",
+            "number,headRefName,title,state",
+            "--limit",
+            "100",
+        ])?;
+
+        if !output.success() {
+            eprintln!("  warning: could not fetch {} PRs from GitHub", state);
+            return Ok(Vec::new());
+        }
+
+        let prs: Vec<GithubPr> =
+            serde_json::from_str(&output.stdout).context("Could not parse PR list from GitHub")?;
+
+        Ok(prs
+            .into_iter()
+            .filter(|pr| Self::is_managed_branch(&pr.head_ref_name))
+            .collect())
+    }
+
+    fn is_managed_branch(branch_name: &str) -> bool {
+        branch_name.starts_with(PUSH_BRANCH_PREFIX)
+            || branch_name.starts_with(CHANGES_BRANCH_PREFIX)
     }
 
     /// Handle bookmarks that were squashed into the same commit
