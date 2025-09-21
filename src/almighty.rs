@@ -1,5 +1,5 @@
 use crate::command::CommandExecutor;
-use crate::constants::DEFAULT_BASE_BRANCH;
+use crate::constants::{CHANGES_BRANCH_PREFIX, DEFAULT_BASE_BRANCH, PUSH_BRANCH_PREFIX};
 use crate::github::GitHubClient;
 use crate::jj::JujutsuClient;
 use crate::state::StateManager;
@@ -46,6 +46,8 @@ impl AlmightyPush {
 
         // Categorize revisions
         let (to_create, to_update) = self.categorize_revisions(revisions, &existing_branches)?;
+        let created_count = to_create.len();
+        let updated_count = to_update.len();
 
         // Check for PRs to reopen
         let mut updated_to_update = to_update;
@@ -59,15 +61,24 @@ impl AlmightyPush {
         // Push branches
         self.jj.push_revisions(&mut all_revisions)?;
 
-        // Copy updated branch names back to original revisions
-        for (i, rev) in all_revisions.iter().enumerate() {
-            if let Some(branch_name) = &rev.branch_name {
-                revisions[i].branch_name = Some(branch_name.clone());
+        // Copy updated branch names back to original revisions using change-id lookup
+        let branch_map: HashMap<_, _> = all_revisions
+            .iter()
+            .filter_map(|rev| {
+                rev.branch_name
+                    .as_ref()
+                    .map(|branch| (rev.change_id.clone(), branch.clone()))
+            })
+            .collect();
+
+        for rev in revisions.iter_mut() {
+            if let Some(branch_name) = branch_map.get(&rev.change_id) {
+                rev.branch_name = Some(branch_name.clone());
             }
         }
 
         // Print summary
-        self.print_push_summary(&all_revisions)?;
+        self.print_push_summary(created_count, updated_count)?;
 
         Ok(existing_branches)
     }
@@ -106,15 +117,10 @@ impl AlmightyPush {
         revision: &Revision,
         existing_branches: &HashMap<String, String>,
     ) -> Option<String> {
-        for branch_name in existing_branches.keys() {
-            for n in &[8, 12] {
-                let len = revision.change_id.len().min(*n);
-                if branch_name.contains(&revision.change_id[..len]) {
-                    return Some(branch_name.clone());
-                }
-            }
-        }
-        None
+        existing_branches
+            .keys()
+            .find(|branch_name| Self::branch_matches_change(branch_name, &revision.change_id))
+            .cloned()
     }
 
     /// Check if any PRs need to be reopened
@@ -130,19 +136,16 @@ impl AlmightyPush {
 
         for rev in revisions {
             for branch_name in existing_branches.keys() {
-                for n in &[8, 12] {
-                    let len = rev.change_id.len().min(*n);
-                    if branch_name.contains(&rev.change_id[..len]) {
-                        if self.github.reopen_pr_if_needed(branch_name)? {
-                            // Add to update list if not already there
-                            if !to_update.iter().any(|r| r.change_id == rev.change_id) {
-                                let mut updated_rev = rev.clone();
-                                updated_rev.branch_name = Some(branch_name.clone());
-                                to_update.push(updated_rev);
-                            }
+                if Self::branch_matches_change(branch_name, &rev.change_id) {
+                    if self.github.reopen_pr_if_needed(branch_name)? {
+                        // Add to update list if not already there
+                        if !to_update.iter().any(|r| r.change_id == rev.change_id) {
+                            let mut updated_rev = rev.clone();
+                            updated_rev.branch_name = Some(branch_name.clone());
+                            to_update.push(updated_rev);
                         }
-                        break;
                     }
+                    break;
                 }
             }
         }
@@ -150,31 +153,35 @@ impl AlmightyPush {
         Ok(())
     }
 
+    /// Check whether a managed branch corresponds to the given change id
+    fn branch_matches_change(branch_name: &str, change_id: &str) -> bool {
+        let prefixes = [PUSH_BRANCH_PREFIX, CHANGES_BRANCH_PREFIX];
+
+        for prefix in prefixes {
+            if let Some(stripped) = branch_name.strip_prefix(prefix) {
+                let len = stripped.len().min(change_id.len());
+                return stripped[..len].eq_ignore_ascii_case(&change_id[..len]);
+            }
+        }
+
+        false
+    }
+
     /// Print summary of push operations
-    fn print_push_summary(&self, revisions: &[Revision]) -> Result<()> {
-        if revisions.is_empty() {
+    fn print_push_summary(&self, created_count: usize, updated_count: usize) -> Result<()> {
+        if created_count == 0 && updated_count == 0 {
             return Ok(());
         }
 
-        let (created, updated): (Vec<_>, Vec<_>) = revisions
-            .iter()
-            .partition(|r| r.branch_name.is_some() && !r.has_pr());
-
-        let created_count = created.len();
-        let updated_count = updated.len();
-        let total = created_count + updated_count;
-
-        if total > 0 {
-            if created_count > 0 && updated_count > 0 {
-                eprintln!(
-                    "  Created {} branches, updated {}",
-                    created_count, updated_count
-                );
-            } else if created_count > 0 {
-                eprintln!("  Created {} new branches", created_count);
-            } else {
-                eprintln!("  Updated {} existing branches", updated_count);
-            }
+        if created_count > 0 && updated_count > 0 {
+            eprintln!(
+                "  Created {} branches, updated {}",
+                created_count, updated_count
+            );
+        } else if created_count > 0 {
+            eprintln!("  Created {} new branches", created_count);
+        } else {
+            eprintln!("  Updated {} existing branches", updated_count);
         }
 
         Ok(())

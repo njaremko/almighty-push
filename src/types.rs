@@ -46,11 +46,6 @@ impl Revision {
         &self.change_id[..self.change_id.len().min(8)]
     }
 
-    /// Check if revision has an associated PR
-    pub fn has_pr(&self) -> bool {
-        self.pr_url.is_some()
-    }
-
     /// Extract PR number from URL
     pub fn extract_pr_number(&self) -> Option<u32> {
         self.pr_url.as_ref().and_then(|url| {
