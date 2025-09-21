@@ -1,0 +1,5 @@
+.jj
+target
+__pycache__
+*.local.*
+.almighty
