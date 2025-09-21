@@ -67,15 +67,24 @@ impl CommandExecutor {
 
         let result = CommandOutput::from(output);
 
+        // In verbose mode, always show output for all commands
+        if self.verbose {
+            eprintln!("[debug] Exit code: {}", result.exit_code);
+            if !result.stdout.trim().is_empty() {
+                eprintln!("[debug] Output:\n{}", result.stdout.trim());
+            }
+            if !result.stderr.trim().is_empty() {
+                eprintln!("[debug] Stderr:\n{}", result.stderr.trim());
+            }
+        }
+
         if check && !result.success() {
-            if self.verbose {
+            if !self.verbose {
+                // Only show error details if not already shown in verbose mode
                 eprintln!("[debug] Command failed: {}", args.join(" "));
                 eprintln!("[debug] Exit code: {}", result.exit_code);
-                if !result.stdout.is_empty() {
-                    eprintln!("[debug] Stdout: {}", result.stdout);
-                }
                 if !result.stderr.is_empty() {
-                    eprintln!("[debug] Stderr: {}", result.stderr);
+                    eprintln!("[debug] Error: {}", result.stderr.trim());
                 }
             }
             anyhow::bail!(
