@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     }
 
     // Initialize components
-    let executor = CommandExecutor::new_verbose(args.verbose);
+    let executor = CommandExecutor::new_verbose(args.verbose).with_dry_run(args.dry_run);
     let jj_client = JujutsuClient::new(executor.clone());
     let state_manager = StateManager::new();
     let github_client = GitHubClient::new(executor.clone(), state_manager);
@@ -82,8 +82,12 @@ fn main() -> Result<()> {
 
 fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
     // We need to create a new JujutsuClient for getting revisions
-    let executor = CommandExecutor::new_verbose(almighty.executor.verbose);
-    let jj_client = JujutsuClient::new(executor);
+    let executor = CommandExecutor::new_verbose(almighty.executor.verbose).with_dry_run(args.dry_run);
+    let jj_client = JujutsuClient::new(executor.clone());
+
+    // Fetch latest changes from remote
+    eprintln!("Fetching latest changes from remote...");
+    executor.run(&["jj", "git", "fetch"])?;
 
     // Get revisions in the stack
     let mut revisions = jj_client.get_revisions_above_base(DEFAULT_BASE_BRANCH)?;
@@ -96,16 +100,16 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
             let closed_prs = almighty.close_orphaned_prs(&[], None, args.delete_branches)?;
 
             // Save state even when no revisions
-            almighty.save_state(&[], &closed_prs)?;
+            if !args.dry_run {
+                almighty.save_state(&[], &closed_prs)?;
+            }
         }
 
         return Ok(());
     }
 
     if args.dry_run {
-        eprintln!("\n[dry-run] Would push {} revision(s)", revisions.len());
-        eprintln!("[dry-run] No changes made");
-        return Ok(());
+        eprintln!("\n[dry-run] Running in simulation mode - no changes will be made");
     }
 
     // Push all revisions
@@ -133,7 +137,9 @@ fn run_almighty(args: Args, almighty: &mut AlmightyPush) -> Result<()> {
         almighty.update_pr_details(&revisions)?;
 
         // Save state for next run
-        almighty.save_state(&revisions, &closed_prs)?;
+        if !args.dry_run {
+            almighty.save_state(&revisions, &closed_prs)?;
+        }
     }
 
     // Summary - PR URLs go to stdout for easy scripting

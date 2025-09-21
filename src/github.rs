@@ -135,13 +135,11 @@ impl GitHubClient {
     /// Check if a PR was previously closed and reopen it if needed
     pub fn reopen_pr_if_needed(&mut self, branch_name: &str) -> Result<bool> {
         let state = self.state_manager.load()?;
-        let closed_prs_map = &state.closed_prs_map;
 
-        if !closed_prs_map.contains_key(branch_name) {
-            return Ok(false);
-        }
-
-        let pr_info = &closed_prs_map[branch_name];
+        let pr_info = match state.get_closed_pr(branch_name) {
+            Some(info) => info,
+            None => return Ok(false),
+        };
         let pr_number = pr_info.pr_number;
 
         // Check PR state
@@ -229,7 +227,30 @@ impl GitHubClient {
         let bookmarks_on_same_commit = jj_client.get_bookmarks_on_same_commit()?;
 
         let state = self.state_manager.load()?;
-        let previous_prs = &state.prs;
+
+        // Build a map of change_id -> PrInfo for quick lookups
+        let previous_prs: HashMap<String, &PrInfo> = state.prs
+            .iter()
+            .map(|pr| (pr.change_id.clone(), pr))
+            .collect();
+
+        // Get all branches we've ever tracked from state
+        let mut tracked_branches: HashSet<String> = state.prs
+            .iter()
+            .map(|pr| pr.branch_name.clone())
+            .collect();
+
+        // Also include branches from closed PRs
+        for closed_pr in &state.closed_prs {
+            tracked_branches.insert(closed_pr.branch_name.clone());
+        }
+
+        // And include branches from current bookmarks state
+        for branch in &state.bookmarks {
+            if Self::is_managed_branch(branch) {
+                tracked_branches.insert(branch.clone());
+            }
+        }
 
         // Get all open PRs from GitHub
         let repo_spec = self.repo_spec()?;
@@ -286,12 +307,13 @@ impl GitHubClient {
             &existing_branches_map,
             &mut orphaned_prs,
             &mut branches_to_delete,
+            &tracked_branches,
         )?;
 
         let context = OrphanedPrContext {
             disappeared_bookmarks: &disappeared_bookmarks,
             squashed_commits: &squashed_commits,
-            previous_prs,
+            previous_prs: &previous_prs,
             active_change_ids: &active_change_ids,
             local_bookmarks: &local_bookmarks,
             active_branches: &active_branches,
@@ -310,13 +332,17 @@ impl GitHubClient {
             if let Some(reason) = Self::should_close_pr(branch_name, change_id.as_deref(), &context)
             {
                 orphaned_prs.push((pr.clone(), reason));
-                branches_to_delete.push(branch_name.clone());
+                // Only delete branches that we've tracked
+                if tracked_branches.contains(branch_name) {
+                    branches_to_delete.push(branch_name.clone());
+                }
             }
         }
 
+
         self.handle_merged_pr_bookmarks(
             jj_client,
-            previous_prs,
+            &previous_prs,
             &local_bookmarks,
             delete_branches,
         )?;
@@ -324,13 +350,20 @@ impl GitHubClient {
         if orphaned_prs.is_empty() {
             if !branches_to_delete.is_empty() {
                 eprintln!(
-                    "  No PRs to close, but found {} orphaned branches",
+                    "  No PRs to close, but found {} orphaned branches we created",
                     branches_to_delete.len()
                 );
                 for branch in &branches_to_delete {
                     eprintln!("    - {}", branch);
                 }
-                if !delete_branches {
+                if delete_branches {
+                    // Delete orphaned bookmarks even when there are no PRs to close
+                    eprintln!("\n  Deleting orphaned bookmarks we created...");
+                    if jj_client.delete_local_bookmarks(&branches_to_delete)? {
+                        // Push all deletions to remote using --deleted
+                        jj_client.push_deleted_bookmarks()?;
+                    }
+                } else {
                     eprintln!("    (use --delete-branches to remove)");
                 }
             } else {
@@ -343,11 +376,16 @@ impl GitHubClient {
         let closed_pr_info = self.close_prs(&orphaned_prs)?;
 
         if !branches_to_delete.is_empty() && delete_branches {
-            jj_client.delete_remote_branches(&branches_to_delete)?;
+            // Delete local orphan bookmarks first
+            eprintln!("\n  Deleting orphaned bookmarks we created...");
+            if jj_client.delete_local_bookmarks(&branches_to_delete)? {
+                // Push all deletions to remote using --deleted
+                jj_client.push_deleted_bookmarks()?;
+            }
         } else if !branches_to_delete.is_empty() {
-            eprintln!("\n  Not deleting remote branches (use --delete-branches)");
+            eprintln!("\n  Not deleting orphaned bookmarks (use --delete-branches)");
             for branch in &branches_to_delete {
-                eprintln!("    Keeping branch: {}", branch);
+                eprintln!("    Keeping bookmark: {}", branch);
             }
         }
 
@@ -357,7 +395,7 @@ impl GitHubClient {
     fn handle_merged_pr_bookmarks(
         &mut self,
         jj_client: &JujutsuClient,
-        previous_prs: &HashMap<String, crate::types::PrInfo>,
+        previous_prs: &HashMap<String, &crate::types::PrInfo>,
         local_bookmarks: &HashSet<String>,
         delete_branches: bool,
     ) -> Result<()> {
@@ -370,6 +408,7 @@ impl GitHubClient {
             return Ok(());
         }
 
+        // Only consider branches we've tracked in our state
         let managed_branches: HashSet<String> = previous_prs
             .values()
             .map(|info| info.branch_name.clone())
@@ -385,10 +424,12 @@ impl GitHubClient {
         for pr in merged_prs {
             let branch_name = pr.head_ref_name;
 
+            // Only process branches we've previously tracked
             if !managed_branches.contains(&branch_name) {
                 continue;
             }
 
+            // And that still exist locally
             if !local_bookmarks.contains(&branch_name) {
                 continue;
             }
@@ -470,6 +511,7 @@ impl GitHubClient {
     }
 
     /// Handle bookmarks that were squashed into the same commit
+    #[allow(clippy::too_many_arguments)]
     fn handle_squashed_bookmarks(
         &self,
         bookmarks_on_same_commit: &HashMap<String, Vec<String>>,
@@ -478,6 +520,7 @@ impl GitHubClient {
         existing_branches: &HashMap<String, String>,
         orphaned_prs: &mut Vec<(GithubPr, String)>,
         branches_to_delete: &mut Vec<String>,
+        tracked_branches: &HashSet<String>,
     ) -> Result<HashSet<String>> {
         let mut squashed_into_same = HashSet::new();
 
@@ -516,7 +559,10 @@ impl GitHubClient {
 
                 for (_pr_num, bookmark, pr) in pr_numbers_for_bookmarks.into_iter().skip(1) {
                     orphaned_prs.push((pr, "squashed into same commit as earlier PR".to_string()));
-                    branches_to_delete.push(bookmark.clone());
+                    // Only delete branches that we've tracked
+                    if tracked_branches.contains(&bookmark) {
+                        branches_to_delete.push(bookmark.clone());
+                    }
                     squashed_into_same.insert(bookmark);
                 }
             }
@@ -527,6 +573,7 @@ impl GitHubClient {
                 if existing_branches.contains_key(clean_bookmark)
                     && !active_branches.contains(clean_bookmark)
                     && !squashed_into_same.contains(clean_bookmark)
+                    && tracked_branches.contains(clean_bookmark)  // Only delete branches we've tracked
                 {
                     branches_to_delete.push(clean_bookmark.to_string());
                 }
@@ -905,7 +952,7 @@ impl GitHubClient {
 struct OrphanedPrContext<'a> {
     disappeared_bookmarks: &'a HashSet<String>,
     squashed_commits: &'a HashSet<String>,
-    previous_prs: &'a HashMap<String, PrInfo>,
+    previous_prs: &'a HashMap<String, &'a PrInfo>,
     active_change_ids: &'a HashSet<String>,
     local_bookmarks: &'a HashSet<String>,
     active_branches: &'a HashSet<String>,

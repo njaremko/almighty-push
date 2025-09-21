@@ -8,7 +8,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 const FIELD_SEPARATOR: char = '|';
-const REVISION_TEMPLATE: &str = r#"change_id.short() ++ "|" ++ change_id ++ "|" ++ commit_id.short() ++ "|" ++ if(empty, "EMPTY", "NOTEMPTY") ++ "|" ++ "" ++ "|" ++ description.first_line() ++ "\n""#;
+const REVISION_TEMPLATE: &str = r#"change_id.short() ++ "|" ++ change_id ++ "|" ++ commit_id.short() ++ "|" ++ if(empty, "EMPTY", "NOTEMPTY") ++ "|" ++ parents.map(|p| p.change_id()).join(",") ++ "|" ++ description.first_line() ++ "\n""#;
 
 /// Handles all Jujutsu (jj) operations
 pub struct JujutsuClient {
@@ -118,7 +118,7 @@ impl JujutsuClient {
             if let Some(parsed) = self.parse_revision_line(line) {
                 if parsed.is_empty {
                     skipped_empty.push(format!(
-                        "{} ({})",
+                        "jj:{} (git:{})",
                         parsed.revision.short_change_id(),
                         parsed.revision.commit_id
                     ));
@@ -352,12 +352,36 @@ impl JujutsuClient {
             .collect();
 
         if !missing_descriptions.is_empty() {
+            // Check if the last commit is the one without description (likely the working copy)
+            let is_working_copy = revisions.last()
+                .map(|last| missing_descriptions.iter().any(|rev| rev.change_id == last.change_id))
+                .unwrap_or(false);
+
             eprintln!("\nerror: the following commits have no description:");
             for rev in &missing_descriptions {
-                eprintln!("  - {} ({})", rev.short_change_id(), rev.commit_id);
+                let is_this_working_copy = revisions.last()
+                    .map(|last| last.change_id == rev.change_id)
+                    .unwrap_or(false);
+
+                if is_this_working_copy {
+                    eprintln!("  - jj:{} (git:{}) [working copy @]", rev.short_change_id(), rev.commit_id);
+                } else {
+                    eprintln!("  - jj:{} (git:{})", rev.short_change_id(), rev.commit_id);
+                }
             }
-            eprintln!("\nAdd descriptions to all commits before pushing.");
-            eprintln!("Use: jj describe -r <change_id> -m \"Your description\"");
+
+            if is_working_copy {
+                eprintln!("\nYour working copy (@) has uncommitted changes with no description.");
+                eprintln!("To push your stack, you can:");
+                eprintln!("  1. Abandon your working copy: jj abandon @");
+                eprintln!("  2. Add a description: jj describe -m \"Your changes\"");
+                if revisions.len() > 1 {
+                    eprintln!("  3. Move to the previous commit: jj edit @-");
+                }
+            } else {
+                eprintln!("\nAdd descriptions to all commits before pushing.");
+                eprintln!("Use: jj describe -r <change_id> -m \"Your description\"");
+            }
             anyhow::bail!("Commits without descriptions found");
         }
 
@@ -417,13 +441,13 @@ impl JujutsuClient {
         Ok(bookmarks)
     }
 
-    /// Delete local bookmarks for merged PRs
+    /// Delete local bookmarks
     pub fn delete_local_bookmarks(&self, bookmarks: &[String]) -> Result<bool> {
         if bookmarks.is_empty() {
             return Ok(false);
         }
 
-        eprintln!("\n  Deleting local bookmarks for merged PRs...");
+        eprintln!("  Deleting local bookmarks...");
 
         let mut args = vec!["jj", "bookmark", "delete"];
         for bookmark in bookmarks {
@@ -635,27 +659,6 @@ impl JujutsuClient {
         change_ids
     }
 
-    /// Delete remote branches
-    pub fn delete_remote_branches(&self, branches: &[String]) -> Result<()> {
-        eprintln!("\n  Deleting remote branches for closed PRs...");
-
-        for branch in branches {
-            let output = self
-                .executor
-                .run_unchecked(&["jj", "git", "push", "--branch", branch, "--delete"])?;
-
-            if output.success() {
-                eprintln!("    Deleted remote branch: {}", branch);
-            } else {
-                eprintln!("    warning: failed to delete remote branch: {}", branch);
-                if !output.stderr.is_empty() {
-                    eprintln!("             {}", output.stderr);
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
