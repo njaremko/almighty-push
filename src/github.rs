@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 pub struct GitHubClient {
     executor: CommandExecutor,
     state_manager: StateManager,
-    repo_info: Option<(String, String)>, // (owner, repo)
+    repo_info: Option<(String, String)>,         // (owner, repo)
+    pr_cache: Option<HashMap<String, GithubPr>>, // Cache of PRs by branch name
 }
 
 impl GitHubClient {
@@ -21,6 +22,7 @@ impl GitHubClient {
             executor,
             state_manager,
             repo_info: None,
+            pr_cache: None,
         }
     }
 
@@ -36,34 +38,25 @@ impl GitHubClient {
             return Ok(info.clone());
         }
 
-        // Try jj git remote command
-        let output =
-            self.executor
-                .run_unchecked(&["jj", "git", "remote", "get-url", DEFAULT_REMOTE])?;
+        // Use jj git remote list to get the URL
+        let list_output = self
+            .executor
+            .run_unchecked(&["jj", "git", "remote", "list"])?;
 
-        let url = if output.success() {
-            output.stdout.trim().to_string()
-        } else {
-            // Try listing remotes as fallback
-            let list_output = self
-                .executor
-                .run_unchecked(&["jj", "git", "remote", "list"])?;
-
-            if list_output.success() && !list_output.stdout.is_empty() {
-                let mut found_url = None;
-                for line in list_output.stdout.lines() {
-                    if line.starts_with(DEFAULT_REMOTE) {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            found_url = Some(parts[1].to_string());
-                            break;
-                        }
+        let url = if list_output.success() && !list_output.stdout.is_empty() {
+            let mut found_url = None;
+            for line in list_output.stdout.lines() {
+                if line.starts_with(DEFAULT_REMOTE) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() > 1 {
+                        found_url = Some(parts[1].to_string());
+                        break;
                     }
                 }
-                found_url.context(format!("Could not find {} remote", DEFAULT_REMOTE))?
-            } else {
-                anyhow::bail!("Could not determine GitHub repository from remote");
             }
+            found_url.context(format!("Could not find {} remote", DEFAULT_REMOTE))?
+        } else {
+            anyhow::bail!("Could not determine GitHub repository from remote");
         };
 
         // Parse GitHub URL
@@ -77,6 +70,66 @@ impl GitHubClient {
 
         self.repo_info = Some((owner.clone(), repo.clone()));
         Ok((owner, repo))
+    }
+
+    /// Load all managed PRs into cache
+    pub fn load_pr_cache(&mut self) -> Result<()> {
+        if self.pr_cache.is_some() {
+            return Ok(());
+        }
+
+        let repo_spec = match self.repo_spec() {
+            Ok(spec) => spec,
+            Err(_) => {
+                self.pr_cache = Some(HashMap::new());
+                return Ok(());
+            }
+        };
+
+        let mut pr_map = HashMap::new();
+
+        // Fetch all PR states to detect merged and closed PRs
+        for state in &["open", "closed", "merged"] {
+            let output = self.executor.run_unchecked(&[
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                &repo_spec,
+                "--state",
+                state,
+                "--json",
+                "number,headRefName,title,state,url,baseRefName",
+                "--limit",
+                "200", // Reasonable limit for managed PRs
+            ])?;
+
+            if output.success() {
+                if let Ok(prs) = serde_json::from_str::<Vec<GithubPr>>(&output.stdout) {
+                    for pr in prs {
+                        // Only cache PRs with our managed branch prefixes
+                        if Self::is_managed_branch(&pr.head_ref_name) {
+                            if let Some(change_id) =
+                                self.extract_change_id_from_branch(&pr.head_ref_name)
+                            {
+                                if *state == "merged" {
+                                    // Mark merged PRs permanently
+                                    self.state_manager.mark_pr_as_merged(&change_id)?;
+                                } else if *state == "closed" {
+                                    // Mark closed PRs permanently
+                                    self.state_manager.mark_pr_as_closed(&change_id)?;
+                                }
+                            }
+                            // Cache all PRs for reference
+                            pr_map.insert(pr.head_ref_name.clone(), pr);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.pr_cache = Some(pr_map);
+        Ok(())
     }
 
     /// Get existing branches from GitHub that match our patterns
@@ -177,7 +230,9 @@ impl GitHubClient {
         ])?;
 
         if reopen_output.success() {
-            eprintln!("    Reopened PR #{}", pr_number);
+            if self.executor.verbose {
+                eprintln!("    Reopened PR #{}", pr_number);
+            }
 
             // Add comment
             let comment = "This PR was automatically reopened because the commit has been separated back out in the stack.";
@@ -229,16 +284,15 @@ impl GitHubClient {
         let state = self.state_manager.load()?;
 
         // Build a map of change_id -> PrInfo for quick lookups
-        let previous_prs: HashMap<String, &PrInfo> = state.prs
+        let previous_prs: HashMap<String, &PrInfo> = state
+            .prs
             .iter()
             .map(|pr| (pr.change_id.clone(), pr))
             .collect();
 
         // Get all branches we've ever tracked from state
-        let mut tracked_branches: HashSet<String> = state.prs
-            .iter()
-            .map(|pr| pr.branch_name.clone())
-            .collect();
+        let mut tracked_branches: HashSet<String> =
+            state.prs.iter().map(|pr| pr.branch_name.clone()).collect();
 
         // Also include branches from closed PRs
         for closed_pr in &state.closed_prs {
@@ -327,7 +381,7 @@ impl GitHubClient {
                 continue;
             }
 
-            let change_id = Self::extract_change_id_from_branch(branch_name);
+            let change_id = self.extract_change_id_from_branch(branch_name);
 
             if let Some(reason) = Self::should_close_pr(branch_name, change_id.as_deref(), &context)
             {
@@ -338,7 +392,6 @@ impl GitHubClient {
                 }
             }
         }
-
 
         self.handle_merged_pr_bookmarks(
             jj_client,
@@ -366,8 +419,6 @@ impl GitHubClient {
                 } else {
                     eprintln!("    (use --delete-branches to remove)");
                 }
-            } else {
-                eprintln!("  No orphaned PRs or branches to clean up");
             }
             return Ok(Vec::new());
         }
@@ -456,13 +507,24 @@ impl GitHubClient {
         }
 
         if delete_branches {
+            eprintln!("  Deleting merged PR bookmarks...");
             let bookmarks_to_delete: Vec<String> = merged_bookmarks
                 .iter()
                 .map(|(_, branch)| branch.clone())
                 .collect();
 
             if jj_client.delete_local_bookmarks(&bookmarks_to_delete)? {
+                eprintln!("  Pushing bookmark deletions to remote...");
                 jj_client.push_deleted_bookmarks()?;
+                eprintln!(
+                    "  Deleted {} merged PR bookmark{}",
+                    bookmarks_to_delete.len(),
+                    if bookmarks_to_delete.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
             }
         } else {
             eprintln!("    (use --delete-branches to remove merged bookmarks)");
@@ -573,7 +635,8 @@ impl GitHubClient {
                 if existing_branches.contains_key(clean_bookmark)
                     && !active_branches.contains(clean_bookmark)
                     && !squashed_into_same.contains(clean_bookmark)
-                    && tracked_branches.contains(clean_bookmark)  // Only delete branches we've tracked
+                    && tracked_branches.contains(clean_bookmark)
+                // Only delete branches we've tracked
                 {
                     branches_to_delete.push(clean_bookmark.to_string());
                 }
@@ -584,7 +647,7 @@ impl GitHubClient {
     }
 
     /// Extract change ID from branch name
-    fn extract_change_id_from_branch(branch_name: &str) -> Option<String> {
+    fn extract_change_id_from_branch(&self, branch_name: &str) -> Option<String> {
         if let Some(stripped) = branch_name.strip_prefix(PUSH_BRANCH_PREFIX) {
             Some(stripped.to_string())
         } else {
@@ -697,8 +760,42 @@ impl GitHubClient {
 
         let branch_name = revision.branch_name.as_ref().unwrap();
 
+        // Check if this change ID has a merged or closed PR (permanent skip)
+        let state = self.state_manager.load()?;
+        if state.merged_pr_change_ids.contains(&revision.change_id) {
+            // This change has a merged PR, skip it
+            revision.pr_state = Some(crate::types::PrState::Merged);
+            if self.executor.verbose {
+                eprintln!(
+                    "  Skipping {} - already has merged PR",
+                    revision.short_change_id()
+                );
+            }
+            return Ok(true);
+        }
+
+        if state.closed_pr_change_ids.contains(&revision.change_id) {
+            // This change has a closed PR, skip it
+            revision.pr_state = Some(crate::types::PrState::Closed);
+            if self.executor.verbose {
+                eprintln!(
+                    "  Skipping {} - already has closed PR",
+                    revision.short_change_id()
+                );
+            }
+            return Ok(true);
+        }
+
+        // Check cache first
+        let existing_pr = if let Some(cache) = &self.pr_cache {
+            cache.get(branch_name).cloned()
+        } else {
+            // Fallback to individual lookup if cache not loaded
+            self.get_existing_pr(branch_name)?
+        };
+
         // Check if PR already exists
-        if let Some(existing_pr) = self.get_existing_pr(branch_name)? {
+        if let Some(existing_pr) = existing_pr {
             // Check PR state - default to "open" if empty
             let pr_state = if existing_pr.state.is_empty() {
                 "open"
@@ -706,22 +803,37 @@ impl GitHubClient {
                 &existing_pr.state.to_lowercase()
             };
 
-            // Only update base if PR is open
-            if pr_state == "open" {
-                if let Some(current_base) = existing_pr.base_ref_name {
-                    if current_base != base_branch {
-                        self.update_pr_base(branch_name, base_branch)?;
-                    }
+            // Set PR state in revision
+            revision.pr_state = match pr_state {
+                "merged" => {
+                    // Save to state that this change ID has a merged PR
+                    self.state_manager.mark_pr_as_merged(&revision.change_id)?;
+                    Some(crate::types::PrState::Merged)
                 }
-            } else {
-                eprintln!(
-                    "  PR for {} is {}, skipping base update",
-                    revision.short_change_id(),
-                    pr_state
-                );
+                "closed" => {
+                    // Save to state that this change ID has a closed PR
+                    self.state_manager.mark_pr_as_closed(&revision.change_id)?;
+                    Some(crate::types::PrState::Closed)
+                }
+                _ => Some(crate::types::PrState::Open),
+            };
+
+            // Skip updating merged/closed PRs
+            if pr_state == "merged" || pr_state == "closed" {
+                revision.pr_url = Some(existing_pr.url);
+                revision.pr_number = Some(existing_pr.number);
+                return Ok(true);
+            }
+
+            // Only update base if PR is open
+            if let Some(current_base) = existing_pr.base_ref_name {
+                if current_base != base_branch {
+                    self.update_pr_base(branch_name, base_branch)?;
+                }
             }
 
             revision.pr_url = Some(existing_pr.url);
+            revision.pr_number = Some(existing_pr.number);
             return Ok(true);
         }
 
@@ -749,6 +861,7 @@ impl GitHubClient {
         if output.success() {
             let pr_url = output.stdout.trim().to_string();
             revision.pr_url = Some(pr_url.clone());
+            revision.pr_state = Some(crate::types::PrState::Open);
             eprintln!("  Created PR for {}", revision.short_change_id());
             Ok(true)
         } else {
@@ -794,7 +907,7 @@ impl GitHubClient {
     }
 
     /// Update the base branch of a PR
-    fn update_pr_base(&mut self, branch_name: &str, new_base: &str) -> Result<()> {
+    pub fn update_pr_base(&mut self, branch_name: &str, new_base: &str) -> Result<()> {
         let repo_spec = self.repo_spec()?;
         let output = self.executor.run_unchecked(&[
             "gh",
@@ -812,9 +925,95 @@ impl GitHubClient {
             if !output.stderr.is_empty() {
                 eprintln!("             {}", output.stderr);
             }
+        } else {
+            eprintln!("    Successfully updated PR base to {}", new_base);
         }
 
         Ok(())
+    }
+
+    /// Update multiple PR bases for reordered commits
+    pub fn update_pr_bases_for_reorder(
+        &mut self,
+        revisions: &[Revision],
+        pr_updates: &HashMap<u32, String>,
+    ) -> Result<()> {
+        if pr_updates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!("\nUpdating PR base branches for reordered commits...");
+
+        for (pr_number, branch_name) in pr_updates {
+            // Find the revision for this PR
+            let revision_idx = revisions
+                .iter()
+                .position(|r| r.pr_number == Some(*pr_number));
+
+            if let Some(idx) = revision_idx {
+                let new_base = if idx == 0 {
+                    crate::constants::DEFAULT_BASE_BRANCH.to_string()
+                } else {
+                    revisions[idx - 1]
+                        .branch_name
+                        .clone()
+                        .unwrap_or_else(|| crate::constants::DEFAULT_BASE_BRANCH.to_string())
+                };
+
+                self.update_pr_base(branch_name, &new_base)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enhanced orphaned PR detection with better squash/abandon detection
+    #[allow(dead_code)]
+    pub fn detect_orphaned_prs_enhanced(
+        &mut self,
+        current_revisions: &[Revision],
+        jj: &JujutsuClient,
+    ) -> Result<Vec<(u32, String, String)>> {
+        let mut orphaned = Vec::new();
+
+        // Get all our managed branches from GitHub
+        let existing_branches = self.get_existing_branches(false)?;
+
+        // Get recently squashed/abandoned commits
+        let squashed_commits = jj.get_recently_squashed_commits()?;
+
+        // Build set of current change IDs
+        let current_change_ids: HashSet<String> = current_revisions
+            .iter()
+            .map(|r| r.change_id.clone())
+            .collect();
+
+        // Check each existing branch
+        for (branch_name, _) in existing_branches {
+            // Extract change ID from branch name
+            let change_id = self.extract_change_id_from_branch(&branch_name);
+
+            if let Some(change_id) = change_id {
+                // Check if this change still exists
+                let is_orphaned = !current_change_ids.contains(&change_id)
+                    || squashed_commits.iter().any(|s| change_id.starts_with(s));
+
+                if is_orphaned {
+                    // Get PR info
+                    if let Some(pr) = self.get_existing_pr(&branch_name)? {
+                        let reason = if squashed_commits.iter().any(|s| change_id.starts_with(s)) {
+                            "squashed or abandoned".to_string()
+                        } else {
+                            "commit no longer in stack".to_string()
+                        };
+
+                        orphaned.push((pr.number, branch_name.clone(), reason));
+                    }
+                }
+            }
+        }
+
+        Ok(orphaned)
     }
 
     /// Build the PR body with stack information
@@ -862,12 +1061,6 @@ impl GitHubClient {
                 };
 
                 if pr_state != "open" {
-                    eprintln!(
-                        "  Skipping update for PR #{} ({}): PR is {}",
-                        rev.extract_pr_number().unwrap_or(0),
-                        rev.short_change_id(),
-                        pr_state
-                    );
                     continue;
                 }
             }
