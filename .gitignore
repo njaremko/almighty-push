@@ -1,5 +1,8 @@
 .jj
+.almighty.lock
 target
 __pycache__
 *.local.*
 .almighty
+RESEARCH.md
+CLAUDE.md
