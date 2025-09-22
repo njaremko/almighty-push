@@ -56,6 +56,8 @@ struct State {
     operations: Vec<Operation>,
     #[serde(default)]
     last_updated: Option<String>,
+    #[serde(default)]
+    merged_into_pr: HashMap<String, String>,  // Maps change_id -> PR branch it was merged into
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,8 +133,18 @@ fn main() -> Result<()> {
     if !merged.is_empty() {
         handle_merged_prs(&merged, &mut revisions, args.verbose)?;
 
-        // Handle out-of-order merges if detected
-        for (_, change_id, _) in &merged {
+        // Track PRs merged into other PR branches
+        for (_, change_id, base_branch) in &merged {
+            if let Some(ref base) = base_branch {
+                if base.starts_with("push-") && base != "main" {
+                    // This PR was merged into another PR branch
+                    state.merged_into_pr.insert(change_id.clone(), base.clone());
+                    if args.verbose {
+                        eprintln!("Tracking {} as merged into {}", &change_id[..8], base);
+                    }
+                }
+            }
+
             if let Some(pr_info) = state.prs.get(change_id) {
                 handle_out_of_order_merge(pr_info, &state, &repo_info, args.dry_run, args.verbose)?;
             }
@@ -472,10 +484,85 @@ fn create_or_update_prs(revisions: &mut [Revision], state: &State, repo: &str, d
         base_branches.push(base);
     }
 
+    // Collect PR info from previous revisions to avoid borrow conflicts
+    let prev_pr_info: Vec<(Option<u32>, Option<String>)> = revisions.iter()
+        .map(|r| (r.pr_number, r.pr_state.clone()))
+        .collect();
+
     // Second pass: create/update PRs
     for (i, rev) in revisions.iter_mut().enumerate() {
         let branch_name = rev.branch_name.as_ref().context("No branch name")?;
         let base_branch = &base_branches[i];
+
+        // Check if this commit represents a PR that was merged into another PR
+        // This happens when PRs are merged into each other rather than main
+        // The merged commit will have the PR number in its description (e.g., "second (#31)")
+        let pr_regex = regex::Regex::new(r"\(#(\d+)\)").unwrap();
+        let mut skip_pr_creation = false;
+
+        // First check if this is the HEAD of an existing PR
+        // This happens after merging one PR into another - the merged commit becomes the new HEAD
+        if i > 0 {
+            // Check if the previous revision has a PR and if this commit is now its HEAD
+            if let Some(prev_pr_num) = prev_pr_info[i-1].0 {
+                // Check if this commit is the current HEAD of that PR's branch
+                let pr_head_output = run_command(&[
+                    "gh", "pr", "view", &prev_pr_num.to_string(),
+                    "-R", repo,
+                    "--json", "headRefName", "-q", ".headRefName"
+                ], true, verbose)?;
+
+                let pr_branch = pr_head_output.trim();
+                if !pr_branch.is_empty() {
+                    // Check if this commit is the HEAD of that branch
+                    let branch_head = run_command(&[
+                        "jj", "log", "-r", &format!("{}@origin", pr_branch),
+                        "--no-graph", "--template", "change_id", "--limit", "1"
+                    ], true, verbose)?;
+
+                    if branch_head.trim().starts_with(&rev.change_id) || rev.change_id.starts_with(branch_head.trim()) {
+                        skip_pr_creation = true;
+                        // This commit is part of the previous PR
+                        rev.pr_number = Some(prev_pr_num);
+                        rev.pr_state = prev_pr_info[i-1].1.clone();
+                        if verbose {
+                            eprintln!("  Skipping PR creation for {} - already HEAD of PR #{}",
+                                     &rev.change_id[..8], prev_pr_num);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check if the description indicates this was a merged PR
+        if !skip_pr_creation {
+            if let Some(captures) = pr_regex.captures(&rev.description) {
+                if let Some(pr_num_str) = captures.get(1) {
+                    if let Ok(pr_num) = pr_num_str.as_str().parse::<u32>() {
+                        // Check if this PR was merged
+                        let pr_status = run_command(&[
+                            "gh", "pr", "view", &pr_num.to_string(),
+                            "-R", repo,
+                            "--json", "state,mergedAt", "-q", ".state"
+                        ], true, verbose)?;
+
+                        if pr_status.trim() == "MERGED" {
+                            skip_pr_creation = true;
+                            rev.pr_number = Some(pr_num);
+                            rev.pr_state = Some("MERGED".to_string());
+                            if verbose {
+                                eprintln!("  Skipping PR creation for {} - PR #{} was already merged",
+                                         &rev.change_id[..8], pr_num);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if skip_pr_creation {
+            continue;
+        }
 
         // Check if PR exists by branch name
         if let Some(pr) = existing_prs.get(branch_name) {
@@ -648,8 +735,18 @@ fn detect_merged_prs(revisions: &mut [Revision], state: &State, repo: &str, verb
             if let Some(pos) = revisions.iter().position(|r| {
                 change_id.starts_with(&r.change_id) || r.change_id.starts_with(change_id)
             }) {
-                merged.push((pos, change_id.clone(), base_branch));
+                merged.push((pos, change_id.clone(), base_branch.clone()));
                 revisions[pos].pr_state = Some("MERGED".to_string());
+            }
+
+            // If merged but not in current stack, it might have been merged into another PR
+            // We still need to track this for later
+            if revisions.iter().position(|r| {
+                change_id.starts_with(&r.change_id) || r.change_id.starts_with(change_id)
+            }).is_none() && base_branch.is_some() {
+                // This PR was merged but is no longer in the stack
+                // It might have been incorporated into another branch
+                merged.push((usize::MAX, change_id.clone(), base_branch));
             }
         }
     }
