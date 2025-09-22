@@ -498,9 +498,16 @@ fn create_or_update_prs(revisions: &mut [Revision], state: &State, repo: &str, d
         let base = if i == 0 {
             "main".to_string()
         } else {
-            // Handle merge commits with multiple parents
-            if revisions[i].parent_change_ids.len() > 1 {
-                // Use first parent as primary base
+            // Check if the previous revision was merged into another PR branch
+            // This handles the case where PRs are merged into each other rather than main
+            let prev_change_id = &revisions[i-1].change_id;
+            if let Some(merged_into_branch) = state.merged_into_pr.iter()
+                .find(|(id, _)| id.starts_with(prev_change_id) || prev_change_id.starts_with(id.as_str()))
+                .map(|(_, branch)| branch.clone()) {
+                // The previous PR was merged into another branch, use that as the base
+                merged_into_branch
+            } else if revisions[i].parent_change_ids.len() > 1 {
+                // Handle merge commits with multiple parents
                 let primary_parent = &revisions[i].parent_change_ids[0];
                 if let Some(parent_rev) = revisions.iter().find(|r| r.change_id == *primary_parent) {
                     parent_rev.branch_name.clone().unwrap_or_else(|| "main".to_string())
