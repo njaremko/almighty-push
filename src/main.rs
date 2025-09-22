@@ -131,29 +131,59 @@ fn main() -> Result<()> {
     // Check for merged PRs and handle them
     let merged = detect_merged_prs(&mut revisions, &state, &repo_info, args.verbose)?;
     if !merged.is_empty() {
-        handle_merged_prs(&merged, &mut revisions, args.verbose)?;
+        // Separate PRs that are still in stack from those that were merged into other PRs
+        let in_stack: Vec<_> = merged.iter()
+            .filter(|(idx, _, _)| *idx != usize::MAX)
+            .cloned()
+            .collect();
 
-        // Track PRs merged into other PR branches
-        for (_, change_id, base_branch) in &merged {
-            if let Some(ref base) = base_branch {
-                if base.starts_with("push-") && base != "main" {
-                    // This PR was merged into another PR branch
-                    state.merged_into_pr.insert(change_id.clone(), base.clone());
-                    if args.verbose {
-                        eprintln!("Tracking {} as merged into {}", &change_id[..8], base);
+        let merged_into_others: Vec<_> = merged.iter()
+            .filter(|(idx, _, _)| *idx == usize::MAX)
+            .cloned()
+            .collect();
+
+        // Handle PRs that are still in the stack (need rebasing)
+        if !in_stack.is_empty() {
+            handle_merged_prs(&in_stack, &mut revisions, args.verbose)?;
+
+            // Handle out-of-order merges for PRs in stack
+            for (_, change_id, base_branch) in &in_stack {
+                if let Some(ref base) = base_branch {
+                    if base.starts_with("push-") && base != "main" {
+                        // Track that this PR was merged into another PR branch
+                        state.merged_into_pr.insert(change_id.clone(), base.clone());
+                        if args.verbose {
+                            eprintln!("Tracking {} as merged into {}", &change_id[..8], base);
+                        }
                     }
+                }
+
+                if let Some(pr_info) = state.prs.get(change_id) {
+                    handle_out_of_order_merge(pr_info, &state, &repo_info, args.dry_run, args.verbose)?;
                 }
             }
 
-            if let Some(pr_info) = state.prs.get(change_id) {
-                handle_out_of_order_merge(pr_info, &state, &repo_info, args.dry_run, args.verbose)?;
-            }
+            // Re-fetch stack after rebasing
+            revisions = get_stack_revisions(args.verbose)?;
+            // Re-check for conflicts after rebase
+            check_for_conflicts(&mut revisions, args.verbose)?;
         }
 
-        // Re-fetch stack after rebasing
-        revisions = get_stack_revisions(args.verbose)?;
-        // Re-check for conflicts after rebase
-        check_for_conflicts(&mut revisions, args.verbose)?;
+        // Handle PRs merged into other PRs but no longer in stack (just track them)
+        for (_, change_id, base_branch) in &merged_into_others {
+            if let Some(ref base) = base_branch {
+                if base.starts_with("push-") && base != "main" {
+                    // Track that this PR was merged into another PR branch
+                    state.merged_into_pr.insert(change_id.clone(), base.clone());
+                    if args.verbose {
+                        eprintln!("PR {} was merged into {} (no longer in stack)", &change_id[..8], base);
+                    }
+
+                    // Mark this PR as merged in state
+                    state.merged_prs.insert(change_id.clone());
+                }
+            }
+        }
     }
 
     // Handle squashed commits
@@ -757,9 +787,13 @@ fn detect_merged_prs(revisions: &mut [Revision], state: &State, repo: &str, verb
 fn handle_merged_prs(merged: &[(usize, String, Option<String>)], revisions: &mut Vec<Revision>, verbose: bool) -> Result<()> {
     eprintln!("Handling {} merged PRs...", merged.len());
 
-    // Sort merged PRs by position (top to bottom) to handle out-of-order merges
-    let mut sorted_merged = merged.to_vec();
-    sorted_merged.sort_by_key(|&(idx, _, _)| idx);
+    // Filter out merged PRs that are no longer in the stack (marked with usize::MAX)
+    // and sort remaining by position (top to bottom) to handle out-of-order merges
+    let mut sorted_merged: Vec<_> = merged.iter()
+        .filter(|(idx, _, _)| *idx != usize::MAX)
+        .cloned()
+        .collect();
+    sorted_merged.sort_by_key(|(idx, _, _)| *idx);
 
     for (idx, change_id, base_branch) in sorted_merged {
         if verbose {
