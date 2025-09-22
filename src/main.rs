@@ -132,7 +132,7 @@ fn main() -> Result<()> {
         handle_merged_prs(&merged, &mut revisions, args.verbose)?;
 
         // Handle out-of-order merges if detected
-        for (_, change_id) in &merged {
+        for (_, change_id, _) in &merged {
             if let Some(pr_info) = state.prs.get(change_id) {
                 handle_out_of_order_merge(pr_info, &state, &repo_info, args.dry_run, args.verbose)?;
             }
@@ -425,8 +425,8 @@ fn check_needs_force_push(branch_name: &str, local_commit: &str, verbose: bool) 
         "--no-graph", "--template", "commit_id", "--limit", "1"
     ], true, verbose)?;
 
-    if output.trim().is_empty() {
-        return Ok(false); // New branch
+    if output.trim().is_empty() || output.contains("doesn't exist") || output.contains("Error:") {
+        return Ok(false); // New branch or doesn't exist on remote
     }
 
     let remote_commit = output.trim();
@@ -440,7 +440,8 @@ fn check_needs_force_push(branch_name: &str, local_commit: &str, verbose: bool) 
         "--no-graph", "--limit", "1"
     ], true, verbose)?;
 
-    Ok(output.trim().is_empty()) // If empty, remote is not ancestor, need force
+    // If output contains error or is empty, need force push
+    Ok(output.trim().is_empty() || output.contains("Error:"))
 }
 
 fn create_or_update_prs(revisions: &mut [Revision], state: &State, repo: &str, dry_run: bool, verbose: bool) -> Result<()> {
@@ -623,24 +624,31 @@ fn update_pr_descriptions(revisions: &[Revision], repo: &str, dry_run: bool, ver
     Ok(())
 }
 
-fn detect_merged_prs(revisions: &mut [Revision], state: &State, repo: &str, verbose: bool) -> Result<Vec<(usize, String)>> {
+fn detect_merged_prs(revisions: &mut [Revision], state: &State, repo: &str, verbose: bool) -> Result<Vec<(usize, String, Option<String>)>> {
     let mut merged = Vec::new();
 
     // Check PRs from state
     for (change_id, pr_info) in &state.prs {
-        // Check if PR is merged on GitHub
+        // Check if PR is merged on GitHub and get its base branch
         let output = run_command(&[
             "gh", "pr", "view", &pr_info.pr_number.to_string(),
             "-R", repo,
-            "--json", "state,mergedAt"
+            "--json", "state,mergedAt,baseRefName"
         ], true, verbose)?;
 
         if output.contains("\"mergedAt\":") && !output.contains("\"mergedAt\":null") || output.contains("\"state\":\"MERGED\"") {
+            // Extract base branch from JSON
+            let base_branch = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
+                json["baseRefName"].as_str().map(String::from)
+            } else {
+                None
+            };
+
             // Find position in current stack using prefix matching
             if let Some(pos) = revisions.iter().position(|r| {
                 change_id.starts_with(&r.change_id) || r.change_id.starts_with(change_id)
             }) {
-                merged.push((pos, change_id.clone()));
+                merged.push((pos, change_id.clone(), base_branch));
                 revisions[pos].pr_state = Some("MERGED".to_string());
             }
         }
@@ -649,50 +657,57 @@ fn detect_merged_prs(revisions: &mut [Revision], state: &State, repo: &str, verb
     Ok(merged)
 }
 
-fn handle_merged_prs(merged: &[(usize, String)], revisions: &mut Vec<Revision>, verbose: bool) -> Result<()> {
+fn handle_merged_prs(merged: &[(usize, String, Option<String>)], revisions: &mut Vec<Revision>, verbose: bool) -> Result<()> {
     eprintln!("Handling {} merged PRs...", merged.len());
 
     // Sort merged PRs by position (top to bottom) to handle out-of-order merges
     let mut sorted_merged = merged.to_vec();
-    sorted_merged.sort_by_key(|&(idx, _)| idx);
+    sorted_merged.sort_by_key(|&(idx, _, _)| idx);
 
-    for (idx, change_id) in sorted_merged {
+    for (idx, change_id, base_branch) in sorted_merged {
         if verbose {
             eprintln!("  Processing merged PR at position {} (change {})", idx, &change_id[..8]);
-        }
-
-        // Check if this is an out-of-order merge (i.e., not the first in stack)
-        let is_out_of_order = idx > 0 && revisions.iter()
-            .take(idx)
-            .any(|r| r.pr_state.as_deref() != Some("MERGED"));
-
-        if is_out_of_order && verbose {
-            eprintln!("    Detected out-of-order merge");
+            if let Some(ref base) = base_branch {
+                eprintln!("    Merged into: {}", base);
+            }
         }
 
         if idx + 1 < revisions.len() {
             // Rebase commits above the merged one
             let source = &revisions[idx + 1].change_id;
-            let destination = if idx == 0 {
-                "main@origin"
+
+            // Determine destination based on where this PR was merged
+            let destination = if let Some(ref base) = base_branch {
+                if base.starts_with("push-") && base != "main" {
+                    // PR was merged into another PR branch - rebase onto that branch's current state
+                    if verbose {
+                        eprintln!("    PR was merged into another PR branch ({}), rebasing onto {}@origin", base, base);
+                    }
+                    format!("{}@origin", base)
+                } else {
+                    // PR was merged into main
+                    "main@origin".to_string()
+                }
+            } else if idx == 0 {
+                "main@origin".to_string()
             } else {
-                // For out-of-order merges, find the previous unmerged commit
+                // For out-of-order merges to main, find the previous unmerged commit
                 let mut dest_idx = idx - 1;
                 while dest_idx > 0 && revisions[dest_idx].pr_state.as_deref() == Some("MERGED") {
                     dest_idx -= 1;
                 }
 
                 if revisions[dest_idx].pr_state.as_deref() == Some("MERGED") {
-                    "main@origin"
+                    "main@origin".to_string()
                 } else {
-                    &revisions[dest_idx].change_id
+                    revisions[dest_idx].change_id.clone()
                 }
             };
 
             if verbose {
                 eprintln!("  Rebasing {} onto {}", &source[..8], destination);
             }
-            run_command(&["jj", "rebase", "-s", source, "-d", destination], false, verbose)?;
+            run_command(&["jj", "rebase", "-s", source, "-d", &destination], false, verbose)?;
         }
     }
 
@@ -719,29 +734,43 @@ fn close_orphaned_prs(current: &[Revision], state: &mut State, squashed: &HashSe
         let should_close = (!still_in_stack && !is_merged) || was_squashed;
 
         if should_close {
-            eprintln!("Closing orphaned PR #{}", pr_info.pr_number);
-
             if !dry_run {
-                let comment = if squashed.iter().any(|s| change_id.starts_with(s)) {
-                    "This PR was closed because the commit was squashed"
-                } else {
-                    "This PR was closed because the commit was removed from the stack"
-                };
-
-                run_command(&[
-                    "gh", "pr", "close", &pr_info.pr_number.to_string(),
+                // First check PR state to avoid closing already closed/merged PRs
+                let pr_status = run_command(&[
+                    "gh", "pr", "view", &pr_info.pr_number.to_string(),
                     "-R", repo,
-                    "--comment", comment
+                    "--json", "state", "-q", ".state"
                 ], true, verbose)?;
 
-                // Track closed PR for potential reopening
-                state.closed_prs.insert(change_id.clone());
+                let status = pr_status.trim();
+                if status == "OPEN" {
+                    eprintln!("Closing orphaned PR #{}", pr_info.pr_number);
 
-                if delete_branches {
+                    let comment = if squashed.iter().any(|s| change_id.starts_with(s)) {
+                        "This PR was closed because the commit was squashed"
+                    } else {
+                        "This PR was closed because the commit was removed from the stack"
+                    };
+
                     run_command(&[
-                        "jj", "git", "push", "-b", &pr_info.branch_name, "--delete"
+                        "gh", "pr", "close", &pr_info.pr_number.to_string(),
+                        "-R", repo,
+                        "--comment", comment
                     ], true, verbose)?;
+
+                    // Track closed PR for potential reopening
+                    state.closed_prs.insert(change_id.clone());
+
+                    if delete_branches {
+                        run_command(&[
+                            "jj", "git", "push", "-b", &pr_info.branch_name, "--delete"
+                        ], true, verbose)?;
+                    }
+                } else if verbose {
+                    eprintln!("  Skipping PR #{} (already {})", pr_info.pr_number, status.to_lowercase());
                 }
+            } else {
+                eprintln!("Would close orphaned PR #{}", pr_info.pr_number);
             }
         }
     }
