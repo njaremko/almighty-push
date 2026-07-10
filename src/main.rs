@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Result};
-use chrono;
 use clap::Parser;
-use regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -670,6 +668,7 @@ fn create_or_update_prs(
         .collect();
 
     // Second pass: create/update PRs
+    let pr_regex = regex::Regex::new(r"\(#(\d+)\)").unwrap();
     for (i, rev) in revisions.iter_mut().enumerate() {
         let branch_name = rev.branch_name.as_ref().context("No branch name")?;
         let base_branch = &base_branches[i];
@@ -677,7 +676,6 @@ fn create_or_update_prs(
         // Check if this commit represents a PR that was merged into another PR
         // This happens when PRs are merged into each other rather than main
         // The merged commit will have the PR number in its description (e.g., "second (#31)")
-        let pr_regex = regex::Regex::new(r"\(#(\d+)\)").unwrap();
         let mut skip_pr_creation = false;
 
         // First check if this is the HEAD of an existing PR
@@ -883,7 +881,7 @@ fn create_or_update_prs(
             // Extract PR URL
             if let Some(url) = output.lines().find(|l| l.contains("github.com")) {
                 rev.pr_url = Some(url.to_string());
-                if let Some(num) = url.split('/').last() {
+                if let Some(num) = url.split('/').next_back() {
                     rev.pr_number = num.parse().ok();
                 }
             }
@@ -1074,7 +1072,7 @@ fn detect_merged_prs(
 
 fn handle_merged_prs(
     merged: &[(usize, String, Option<String>)],
-    revisions: &mut Vec<Revision>,
+    revisions: &mut [Revision],
     dry_run: bool,
     verbose: bool,
 ) -> Result<()> {

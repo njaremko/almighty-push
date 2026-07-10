@@ -52,8 +52,9 @@ or age guessing; its license and transitive tree are recorded with the change.
 For a stack of `N <= 64` and at most `P <= 1,000` observed PRs:
 
 - Local parsing and chain validation are `O(N log N)` time and `O(N)` memory.
-- GitHub observation uses at most 10 PR pages plus one repository and one matching
-  refs request per observation epoch.
+- GitHub observation uses at most 10 compact PR-metadata pages, repository/ref
+  reads, and at most 64 individually bounded body reads for relevant managed PRs
+  per observation epoch; bodies are never multiplied into a page-sized response.
 - Planning is `O((N + P) log(N + P))`, bounded by 512 effects.
 - Execution is sequential because later effects depend on earlier external
   postconditions; worst-case mutation traffic is `O(N + stale_owned_prs)`.
@@ -88,8 +89,8 @@ error variants rather than message strings:
 
 ```rust
 use almighty_push::domain::{
-    ChangeId, CommitId, DomainError, HeadRef, Limits, RepositoryId, Revision,
-    Scope, SelectedChain,
+    ChangeId, CommitId, DomainError, HeadRef, Limits, RemoteName, RepositoryId,
+    Revision, Scope, SelectedChain,
 };
 
 fn revision(id: &str, commit: &str, parents: &[&str]) -> Revision {
@@ -99,8 +100,9 @@ fn revision(id: &str, commit: &str, parents: &[&str]) -> Revision {
         format!("change {id}"),
         parents
             .iter()
-            .map(|parent| ChangeId::parse(parent).unwrap())
+            .map(|parent| ChangeId::parse(*parent).unwrap())
             .collect::<Box<[_]>>(),
+        false,
     )
     .unwrap()
 }
@@ -111,7 +113,7 @@ fn selected_chain_rejects_a_merge_node() {
     let scope = Scope::new(
         repository.clone(),
         repository,
-        "origin".to_owned(),
+        RemoteName::parse("origin").unwrap(),
         HeadRef::parse("main").unwrap(),
         "@".to_owned(),
     )
@@ -173,6 +175,9 @@ pub struct RepositoryId {
     name: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RemoteName(String);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PrLifecycle {
     Open,
@@ -197,10 +202,13 @@ pub struct SelectedChain {
 ```
 
 `ChangeId::parse` accepts exactly 32 jj reverse-hex letters in `k..=z`; `CommitId`
-accepts exactly 40 lowercase hexadecimal characters; `HeadRef` rejects empty,
-leading/trailing slash, `..`, control characters, spaces, and Git-invalid endings.
-`SelectedChain::new` asserts that each non-root revision has exactly one selected
-parent and that every revision except the tip has exactly one selected child.
+accepts exactly 40 lowercase hexadecimal characters. `HeadRef` and `RemoteName`
+validate their exact bounded ref namespaces. `RepositoryId` separately validates
+host labels, owner, and repository name. `Revision` preserves bounded multiline
+UTF-8 descriptions. `Limits` deserializes only through checked compiled minima,
+maxima, and cross-field products. `SelectedChain::new` canonicalizes validation
+errors and requires each non-root revision to have exactly one selected parent and
+every revision except the tip to have exactly one selected child.
 
 - [ ] **Step 4: Export the domain and run exhaustive small-chain tests**
 
@@ -622,9 +630,11 @@ stack ordered base-to-tip.
 
 - [ ] **Step 4: Implement complete paged observations and typed effects**
 
-Read repository metadata, matching owned refs, and pull pages with manual
-`page=1..=10&per_page=100`. A full tenth page is `ObservationIncomplete`, never a
-complete empty/partial set. Parse exact REST JSON into:
+Read repository metadata, matching owned refs, and compact pull metadata pages with
+manual `page=1..=10&per_page=100`; exclude bodies from list responses. A full tenth
+page is `ObservationIncomplete`, never a complete empty/partial set. Fetch complete
+bodies only for the at most 64 exact managed PRs that require ownership or body
+planning, one bounded response per PR. Parse exact REST JSON into:
 
 ```rust
 pub struct GithubSnapshot {
@@ -748,9 +758,9 @@ pub struct Plan {
 }
 ```
 
-Construct owned heads as
-`almighty-push/<source-host>/<source-owner>/<source-repo>/<full-change-id>`.
-Resolve verified
+Construct owned heads as `almighty-push/<full-change-id>`. The head exists inside
+the configured source repository, so the repository supplies scope without
+repeating hundreds of bytes in every ref. Resolve verified
 legacy heads by their exact persisted ref. Derive the whole desired PR relation in
 one pass. Existing open PRs receive base/body effects only when observed values
 differ; closed exact owned PRs reopen; merged PRs become historical.
@@ -822,8 +832,11 @@ pub struct ExecutionCheckpoint {
 }
 ```
 
-Before effect zero, atomically write the full bounded concrete plan. Before each
-mutation, re-read its current external value and require either the postcondition
+Before effect zero, atomically write the full bounded concrete plan. Body effects
+persist only the exact managed section plus expected full-body hash; they never
+persist complete user-authored bodies. The executor re-reads and merges the current
+body immediately before mutation. Before each mutation, re-read its current external
+value and require either the postcondition
 (already complete) or precondition (safe to execute). After command completion or
 failure, read the postcondition. Persist the incremented index only after the
 postcondition holds. Clear the checkpoint atomically after the last effect.
