@@ -17,10 +17,12 @@ force re-observation after a local rebase. The old `src/main.rs` implementation 
 deleted when the new CLI becomes the only runtime path.
 
 **Tech Stack:** Rust 2021 on macOS/Linux, Cargo, `clap`, `serde`, `serde_json`,
-`anyhow`, `fs2`, jj 0.41+ CLI, GitHub `gh` CLI/REST API, and deterministic
-fake-command integration tests. `fs2` is the one new runtime dependency: OS-backed
-file locking is required so crashed processes release exclusion without unsafe PID
-or age guessing; its license and transitive tree are recorded with the change.
+`anyhow`, `fs2`, `libc`, jj 0.41+ CLI, GitHub `gh` CLI/REST API, and deterministic
+fake-command integration tests. `fs2` provides OS-backed crash-released file locks;
+`libc` provides the narrow audited Unix calls needed for process-group signalling,
+handle-relative/no-follow directory opening, child `fchdir`, and nonblocking pipe
+flags. Both dependency decisions, licenses, transitive trees, and failure behavior
+are recorded with the change.
 
 ## Global Constraints
 
@@ -244,7 +246,7 @@ Expected: all commands before `jj commit` exit zero.
 
 **Files:**
 - Create: `src/command.rs`
-- Create: `tests/command_runner.rs`
+- Create: `src/command_tests.rs`
 - Modify: `src/lib.rs`
 
 **Interfaces:**
@@ -255,10 +257,12 @@ Expected: all commands before `jj commit` exit zero.
 
 - [ ] **Step 1: Write failing executable-boundary tests**
 
-Create macOS/Linux tests using temporary shell scripts that produce stdout,
-stderr, nonzero status, output beyond the cap, and a sleep beyond the timeout.
-Assert structured variants and that timeout/output-limit children are killed and
-reaped:
+Create macOS/Linux tests using collision-safe temporary shell scripts that produce
+stdout, stderr, nonzero status, invalid UTF-8, output beyond the cap, and a sleep
+beyond the timeout. Include leader-first exit with inherited and redirected pipes,
+working-directory replacement, redaction sentinels, and one-runner concurrency.
+Assert structured variants, bounded return, and that every same-group descendant
+is killed and the leader reaped:
 
 ```rust
 #[test]
@@ -286,20 +290,44 @@ Expected: compile failure for `almighty_push::command`.
 
 - [ ] **Step 3: Implement bounded concurrent pipe draining**
 
-Implement `CommandSpec` with program, boxed arguments, canonical CWD, bounded
-stdin, timeout, and output limit. Spawn with piped streams; one thread drains each
-output into a capped buffer while continuing to drain after the cap. The parent
-polls `try_wait` every 10 ms, kills on timeout or either cap flag, joins both
-readers, reaps the child, then returns one precise result:
+Implement a private-field `CommandSpec` from validated `Limits`, with an absolute
+program, bounded argument count/checked encoded bytes, an opened CWD handle, bounded
+stdin, and an explicit bounded and cleared environment. Reject NUL and account for
+pointer tables and terminators. Open every CWD component relative to its retained
+parent with `O_NOFOLLOW|O_DIRECTORY`, then execute via `fchdir` in `pre_exec`; path
+replacement and symlink races cannot redirect a mutating command.
+
+One synchronous owner drives nonblocking stdin/stdout/stderr, eliminating detached
+worker and late-publication races. It retains at most the configured combined output
+cap while continuing to drain kernel pipes. Before the command, spawn an owned `/bin/cat` process-group anchor whose piped
+stdin is retained by the parent; the command joins that group. The parent-controlled
+live anchor has no timer and prevents PID/PGID reuse and Darwin zombie-only `EPERM`
+ambiguity after the command exits. Linux enables child-subreaper mode and reaps
+reparented members of the owned group, so PID-1 behavior cannot accumulate zombies.
+Every terminal and unwind path is owned by an RAII session: signal the complete
+anchored group, poll-reap both owned children, reap Linux group descendants, then
+drain to EOF under explicit one-second cleanup bounds. Never suppress `EPERM` or
+release capacity with unresolved owned processes; an inability to establish the
+cleanup invariant aborts rather than continuing in an unknowable state. Cleanup
+uncertainty wraps the fully finalized execution outcome. Poll precedence is final
+output excess, execution deadline, then exit; finalization rechecks all output.
+A per-runner permit plus a process-wide maximum of 16 sessions prevents constructor
+fan-out from removing the concurrency bound. Constructing the runner is an explicit
+unsafe process-ownership obligation: on Linux the application becomes a child
+subreaper, so all child creation must remain coordinated by this boundary; the
+public application layer owns that one authority. Routine `Debug`/`Display` exposes
+counts and status, never arguments, stdin, environment, or captured output:
 
 ```rust
 pub struct CommandSpec {
-    pub program: OsString,
-    pub args: Box<[OsString]>,
-    pub cwd: PathBuf,
-    pub stdin: Box<[u8]>,
-    pub timeout: Duration,
-    pub output_limit_bytes: usize,
+    program: OsString,
+    args: Box<[OsString]>,
+    cwd: PathBuf,
+    cwd_handle: File,
+    stdin: Box<[u8]>,
+    environment: Box<[(OsString, OsString)]>,
+    timeout: Duration, // copied from validated Limits
+    output_limit_bytes: usize, // copied from validated Limits
 }
 
 pub struct CommandOutput {
@@ -312,12 +340,19 @@ pub enum CommandError {
     Timeout { timeout: Duration },
     OutputLimit { limit_bytes: usize },
     Exit { status_code: Option<i32>, stdout: String, stderr: String },
-    Utf8 { stream: OutputStream },
+    Utf8 { stream: OutputStream, source: Utf8Error },
     Io { operation: IoOperation, source: io::Error },
+    Cleanup { outcome: Box<CommandOutcome>, cleanup: Box<[CommandError]> },
 }
 ```
 
-Reject stdin larger than the command output bound. Keep error stdout/stderr capped.
+Keep sensitive success/error output capped and available to explicit callers, but
+redact it from routine formatting. UTF-8 validation deliberately precedes exit-
+status presentation because adapters cannot interpret undecodable responses.
+A zero exit is accepted only after all required stdin bytes were written and the
+pipe was closed; a partial nonblocking write is a typed failure.
+Same-group descendants are contained; descendants that deliberately create a new
+session are outside this trusted-command boundary.
 
 - [ ] **Step 4: Run the runner tests including timeout and cap controls**
 
@@ -1052,8 +1087,10 @@ than preserving conflicting authorities.
 
 Set MIT license, repository/homepage, readme, keywords, categories, and a tested
 Rust version. Remove `chrono` and `regex` when no new module uses them. Retain `fs2`
-only for advisory crash-safe file locking and document its dual license, current
-maintenance, transitive tree, and platform failure behavior. Run
+only for advisory crash-safe file locking and `libc` only for audited Unix process-
+group signalling, no-follow directory traversal, child `fchdir`, and nonblocking
+pipe flags; document their licenses, maintenance, transitive trees, and platform
+failure behavior. Run
 `cargo tree --depth 2` and record the final direct dependency set and the `fs2`
 decision in the changelog.
 
