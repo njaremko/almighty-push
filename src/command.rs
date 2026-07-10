@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -114,11 +115,58 @@ impl Error for SpecError {
     }
 }
 
+pub(crate) struct RetainedRepository {
+    workspace_directory: File,
+    metadata_directory: File,
+}
+
+impl RetainedRepository {
+    pub(crate) fn new(workspace_directory: File, metadata_directory: File) -> Self {
+        Self {
+            workspace_directory,
+            metadata_directory,
+        }
+    }
+}
+
+struct ValidatedCommandInputs {
+    program: OsString,
+    args: Box<[OsString]>,
+    cwd: PathBuf,
+    stdin: Box<[u8]>,
+    environment: Box<[(OsString, OsString)]>,
+    timeout: Duration,
+    output_limit_bytes: usize,
+}
+
+impl ValidatedCommandInputs {
+    fn new(
+        program: OsString,
+        args: Box<[OsString]>,
+        cwd: PathBuf,
+        stdin: Box<[u8]>,
+        environment: Box<[(OsString, OsString)]>,
+        limits: Limits,
+    ) -> Result<Self, SpecError> {
+        validate_spec_inputs(&program, &args, &stdin, &environment)?;
+        Ok(Self {
+            program,
+            args,
+            cwd,
+            stdin,
+            environment,
+            timeout: limits.command_timeout(),
+            output_limit_bytes: limits.command_output_bytes_max(),
+        })
+    }
+}
+
 pub struct CommandSpec {
     program: OsString,
     args: Box<[OsString]>,
     cwd: PathBuf,
     cwd_handle: File,
+    repository: Option<RetainedRepository>,
     stdin: Box<[u8]>,
     environment: Box<[(OsString, OsString)]>,
     timeout: Duration,
@@ -134,30 +182,67 @@ impl CommandSpec {
         environment: Box<[(OsString, OsString)]>,
         limits: Limits,
     ) -> Result<Self, SpecError> {
-        validate_program(&program)?;
-        validate_arguments(&program, &args)?;
-        validate_environment(&environment)?;
-        if stdin.len() > COMMAND_BYTES_MAX {
-            return Err(SpecError::StdinLimit {
-                stdin_bytes: stdin.len(),
-                limit_bytes: COMMAND_BYTES_MAX,
-            });
-        }
-        let cwd_handle = open_directory_no_follow(&cwd).map_err(|source| {
+        let inputs = ValidatedCommandInputs::new(program, args, cwd, stdin, environment, limits)?;
+        let cwd_handle = open_directory_no_follow(&inputs.cwd).map_err(|source| {
             SpecError::InvalidWorkingDirectory {
-                path: cwd.clone(),
+                path: inputs.cwd.clone(),
                 source,
             }
         })?;
+        Self::from_validated_directory(inputs, cwd_handle, None)
+    }
+
+    pub(crate) fn new_in_retained_repository(
+        program: OsString,
+        args: Box<[OsString]>,
+        cwd: PathBuf,
+        repository: RetainedRepository,
+        stdin: Box<[u8]>,
+        environment: Box<[(OsString, OsString)]>,
+        limits: Limits,
+    ) -> Result<Self, SpecError> {
+        let inputs = ValidatedCommandInputs::new(program, args, cwd, stdin, environment, limits)?;
+        let cwd_handle = repository
+            .workspace_directory
+            .try_clone()
+            .map_err(|source| SpecError::InvalidWorkingDirectory {
+                path: inputs.cwd.clone(),
+                source,
+            })?;
+        Self::from_validated_directory(inputs, cwd_handle, Some(repository))
+    }
+
+    fn from_validated_directory(
+        inputs: ValidatedCommandInputs,
+        cwd_handle: File,
+        repository: Option<RetainedRepository>,
+    ) -> Result<Self, SpecError> {
+        let is_directory = cwd_handle
+            .metadata()
+            .map_err(|source| SpecError::InvalidWorkingDirectory {
+                path: inputs.cwd.clone(),
+                source,
+            })?
+            .is_dir();
+        if !is_directory {
+            return Err(SpecError::InvalidWorkingDirectory {
+                path: inputs.cwd,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "retained working directory is not a directory",
+                ),
+            });
+        }
         Ok(Self {
-            program,
-            args,
-            cwd,
+            program: inputs.program,
+            args: inputs.args,
+            cwd: inputs.cwd,
             cwd_handle,
-            stdin,
-            environment,
-            timeout: limits.command_timeout(),
-            output_limit_bytes: limits.command_output_bytes_max(),
+            repository,
+            stdin: inputs.stdin,
+            environment: inputs.environment,
+            timeout: inputs.timeout,
+            output_limit_bytes: inputs.output_limit_bytes,
         })
     }
 
@@ -201,6 +286,24 @@ impl fmt::Debug for CommandSpec {
             .field("output_limit_bytes", &self.output_limit_bytes)
             .finish_non_exhaustive()
     }
+}
+
+fn validate_spec_inputs(
+    program: &OsString,
+    args: &[OsString],
+    stdin: &[u8],
+    environment: &[(OsString, OsString)],
+) -> Result<(), SpecError> {
+    validate_program(program)?;
+    validate_arguments(program, args)?;
+    validate_environment(environment)?;
+    if stdin.len() > COMMAND_BYTES_MAX {
+        return Err(SpecError::StdinLimit {
+            stdin_bytes: stdin.len(),
+            limit_bytes: COMMAND_BYTES_MAX,
+        });
+    }
+    Ok(())
 }
 
 fn validate_program(program: &OsString) -> Result<(), SpecError> {
@@ -290,6 +393,24 @@ fn os_vector_bytes(program: &OsString, args: &[OsString]) -> Option<usize> {
     Some(bytes)
 }
 
+fn open_directory_at(parent: &File, name: &[u8]) -> io::Result<File> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: parent and component are valid; no-follow rejects link traversal.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 fn open_directory_no_follow(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -372,6 +493,10 @@ pub enum CommandError {
         operation: IoOperation,
         source: io::Error,
     },
+    RepositoryIdentityChanged,
+    CommandAndRepositoryIdentityChanged {
+        command: Box<CommandError>,
+    },
     Cleanup {
         outcome: Box<CommandOutcome>,
         cleanup: Box<[CommandError]>,
@@ -412,6 +537,13 @@ impl Display for CommandError {
             Self::Io { operation, source } => {
                 write!(formatter, "command {operation:?} failed: {source}")
             }
+            Self::RepositoryIdentityChanged => {
+                formatter.write_str("retained repository identity changed at a command boundary")
+            }
+            Self::CommandAndRepositoryIdentityChanged { command } => write!(
+                formatter,
+                "{command}; retained repository identity also changed"
+            ),
             Self::Cleanup { outcome, cleanup } => match outcome.as_ref() {
                 CommandOutcome::Success(_) => write!(
                     formatter,
@@ -439,6 +571,7 @@ impl Error for CommandError {
         match self {
             Self::Spawn { source, .. } | Self::Io { source, .. } => Some(source),
             Self::Utf8 { source, .. } => Some(source),
+            Self::CommandAndRepositoryIdentityChanged { command } => Some(command),
             Self::Cleanup { outcome, .. } => match outcome.as_ref() {
                 CommandOutcome::Success(_) => None,
                 CommandOutcome::Failure(primary) => Some(primary),
@@ -505,59 +638,78 @@ impl CommandRunner {
 
     pub fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
         let _permit = SessionPermit::acquire(&self.active)?;
-        ensure_descendant_reaper()?;
-        let deadline = Instant::now() + spec.timeout;
-        let anchor = spawn_anchor().map_err(|source| CommandError::Io {
-            operation: IoOperation::AnchorSpawn,
-            source,
-        })?;
-        let pgid = checked_pid(anchor.id())?;
-        assert!(pgid > 1);
-        let mut session = OwnedSession::new(anchor, pgid);
+        validate_repository_identity(spec).map_err(|_| CommandError::RepositoryIdentityChanged)?;
+        let result = run_admitted(spec);
+        combine_command_and_identity(result, validate_repository_identity(spec))
+    }
+}
 
-        match spawn_command(spec, pgid) {
-            Ok(child) => session.set_child(child),
-            Err(error) => {
-                let cleanup = session.cleanup();
-                return Err(attach_cleanup(error, cleanup));
-            }
-        }
-        let mut pipes = match Pipes::new(session.child_mut(), spec.output_limit_bytes) {
-            Ok(pipes) => pipes,
-            Err(error) => {
-                let cleanup = session.cleanup();
-                return Err(attach_cleanup(error, cleanup));
-            }
-        };
+fn run_admitted(spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
+    ensure_descendant_reaper()?;
+    let deadline = Instant::now() + spec.timeout;
+    let anchor = spawn_anchor().map_err(|source| CommandError::Io {
+        operation: IoOperation::AnchorSpawn,
+        source,
+    })?;
+    let pgid = checked_pid(anchor.id())?;
+    assert!(pgid > 1);
+    let mut session = OwnedSession::new(anchor, pgid);
 
-        let cause = match supervise(session.child_mut(), &mut pipes, deadline, &spec.stdin) {
-            Ok(cause) => cause,
-            Err(primary) => {
-                let mut cleanup = session.cleanup();
-                if let Err(error) = pipes.drain_until_eof(Instant::now() + CLEANUP_TIMEOUT) {
-                    cleanup.push(error);
-                }
-                return Err(attach_cleanup(primary, cleanup));
+    match spawn_command(spec, pgid) {
+        Ok(child) => session.set_child(child),
+        Err(error) => {
+            let cleanup = session.cleanup();
+            return Err(attach_cleanup(error, cleanup));
+        }
+    }
+    let mut pipes = match Pipes::new(session.child_mut(), spec.output_limit_bytes) {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            let cleanup = session.cleanup();
+            return Err(attach_cleanup(error, cleanup));
+        }
+    };
+
+    let cause = match supervise(session.child_mut(), &mut pipes, deadline, &spec.stdin) {
+        Ok(cause) => cause,
+        Err(primary) => {
+            let mut cleanup = session.cleanup();
+            if let Err(error) = pipes.drain_until_eof(Instant::now() + CLEANUP_TIMEOUT) {
+                cleanup.push(error);
             }
-        };
-        let cleanup = session.cleanup();
-        let drain_deadline = Instant::now() + CLEANUP_TIMEOUT;
-        let drain_result = pipes.drain_until_eof(drain_deadline);
-        let mut cleanup_errors = cleanup;
-        if let Err(error) = drain_result {
-            cleanup_errors.push(error);
+            return Err(attach_cleanup(primary, cleanup));
         }
-        let cause = if pipes.output_exceeded {
-            RunCause::OutputLimit
-        } else {
-            cause
-        };
-        let result = finish(cause, pipes, spec);
-        if cleanup_errors.is_empty() {
-            result
-        } else {
-            Err(attach_result_cleanup(result, cleanup_errors))
-        }
+    };
+    let cleanup = session.cleanup();
+    let drain_deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let drain_result = pipes.drain_until_eof(drain_deadline);
+    let mut cleanup_errors = cleanup;
+    if let Err(error) = drain_result {
+        cleanup_errors.push(error);
+    }
+    let cause = if pipes.output_exceeded {
+        RunCause::OutputLimit
+    } else {
+        cause
+    };
+    let result = finish(cause, pipes, spec);
+    if cleanup_errors.is_empty() {
+        result
+    } else {
+        Err(attach_result_cleanup(result, cleanup_errors))
+    }
+}
+
+fn combine_command_and_identity(
+    command: Result<CommandOutput, CommandError>,
+    identity: Result<(), RepositoryIdentityMismatch>,
+) -> Result<CommandOutput, CommandError> {
+    match (command, identity) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(_)) => Err(CommandError::RepositoryIdentityChanged),
+        (Err(command), Err(_)) => Err(CommandError::CommandAndRepositoryIdentityChanged {
+            command: Box::new(command),
+        }),
     }
 }
 
@@ -657,6 +809,49 @@ impl Drop for SessionPermit<'_> {
         let active = self.runner_active.swap(false, Ordering::AcqRel);
         assert!(active);
     }
+}
+
+struct RepositoryIdentityMismatch;
+
+fn validate_repository_identity(spec: &CommandSpec) -> Result<(), RepositoryIdentityMismatch> {
+    let Some(repository) = &spec.repository else {
+        return Ok(());
+    };
+
+    let current_workspace =
+        open_directory_no_follow(&spec.cwd).map_err(|_| RepositoryIdentityMismatch)?;
+    let current_workspace_identity =
+        directory_identity(&current_workspace).map_err(|_| RepositoryIdentityMismatch)?;
+    let retained_workspace_identity = directory_identity(&repository.workspace_directory)
+        .map_err(|_| RepositoryIdentityMismatch)?;
+    let cwd_handle_identity =
+        directory_identity(&spec.cwd_handle).map_err(|_| RepositoryIdentityMismatch)?;
+    let named_workspace_matches = current_workspace_identity == retained_workspace_identity;
+    let cwd_handle_matches = cwd_handle_identity == retained_workspace_identity;
+    if !named_workspace_matches || !cwd_handle_matches {
+        return Err(RepositoryIdentityMismatch);
+    }
+
+    let current_metadata = open_directory_at(&repository.workspace_directory, b".jj")
+        .map_err(|_| RepositoryIdentityMismatch)?;
+    let current_metadata_identity =
+        directory_identity(&current_metadata).map_err(|_| RepositoryIdentityMismatch)?;
+    let retained_metadata_identity = directory_identity(&repository.metadata_directory)
+        .map_err(|_| RepositoryIdentityMismatch)?;
+    if current_metadata_identity != retained_metadata_identity {
+        return Err(RepositoryIdentityMismatch);
+    }
+
+    // jj 0.41 cannot consume an already-open metadata directory. Admission and
+    // completion checks detect identity drift, while the child consumes only
+    // the retained workspace handle for its CWD. They cannot eliminate a
+    // same-UID rename between admission and jj opening `.jj`.
+    Ok(())
+}
+
+fn directory_identity(directory: &File) -> io::Result<(u64, u64)> {
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn spawn_anchor() -> io::Result<Child> {

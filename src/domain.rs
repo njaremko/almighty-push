@@ -499,6 +499,7 @@ pub struct Scope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScopeWire {
     source_repository: RepositoryId,
     target_repository: RepositoryId,

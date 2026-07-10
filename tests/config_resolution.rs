@@ -141,6 +141,45 @@ fn remote_urls_preserve_the_actual_authority_and_repository() {
 }
 
 #[test]
+fn locked_resolution_acquires_before_remote_observation() {
+    let workspace = workspace();
+    let first_executor = FakeExecutor::new([
+        workspace.to_str().unwrap(),
+        "origin https://github.com/owner/project.git\n",
+    ]);
+    let first_resolver = ConfigResolver::new(
+        &first_executor,
+        PathBuf::from("/fake/jj"),
+        PathBuf::from("/fake/gh"),
+        Box::new([]),
+    );
+    let mut locked_input = input(false);
+    locked_input.limits = Limits::new(LimitValues {
+        lock_wait_ms: 100,
+        ..LimitValues::default()
+    })
+    .unwrap();
+    let locked = first_resolver
+        .resolve_locked(&locked_input, &workspace)
+        .unwrap();
+
+    let second_executor = FakeExecutor::new([workspace.to_str().unwrap()]);
+    let second_resolver = ConfigResolver::new(
+        &second_executor,
+        PathBuf::from("/fake/jj"),
+        PathBuf::from("/fake/gh"),
+        Box::new([]),
+    );
+    assert!(matches!(
+        second_resolver.resolve_locked(&locked_input, &workspace),
+        Err(ConfigError::ConfigurationLockContended { .. })
+    ));
+    assert_eq!(second_executor.arguments().len(), 1);
+    drop(locked);
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
 fn exact_remote_and_no_pr_mode_resolve_without_gh() {
     let workspace = workspace();
     let executor = FakeExecutor::new([
@@ -181,6 +220,37 @@ fn exact_remote_and_no_pr_mode_resolve_without_gh() {
             (workspace.clone(), 0, Duration::from_secs(1), 65_536),
         ]
     );
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn configuration_keeps_github_credentials_out_of_every_jj_process() {
+    let workspace = workspace();
+    let executor = FakeExecutor::new([
+        workspace.to_str().unwrap(),
+        "origin https://github.com/owner/project.git\n",
+        r#"{"full_name":"owner/project","default_branch":"main"}"#,
+        r#"{"name":"main"}"#,
+    ]);
+    let resolver = ConfigResolver::new_with_environments(
+        &executor,
+        PathBuf::from("/fake/jj"),
+        PathBuf::from("/fake/gh"),
+        Box::new([(OsString::from("PATH"), OsString::from("/bin"))]),
+        Box::new([
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("GH_TOKEN"), OsString::from("secret")),
+        ]),
+    );
+
+    resolver.resolve(&input(true), &workspace).unwrap();
+
+    let environment_counts = executor
+        .contracts()
+        .into_iter()
+        .map(|(_, count, _, _)| count)
+        .collect::<Vec<_>>();
+    assert_eq!(environment_counts, vec![1, 1, 2, 2]);
     fs::remove_dir_all(workspace).unwrap();
 }
 

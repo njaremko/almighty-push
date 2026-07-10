@@ -16,13 +16,34 @@ preconditions, postconditions, timeouts, and durable checkpoints; mutation barri
 force re-observation after a local rebase. The old `src/main.rs` implementation is
 deleted when the new CLI becomes the only runtime path.
 
-**Tech Stack:** Rust 2021 on macOS/Linux, Cargo, `clap`, `serde`, `serde_json`,
-`anyhow`, `fs2`, `libc`, jj 0.41+ CLI, GitHub `gh` CLI/REST API, and deterministic
-fake-command integration tests. `fs2` provides OS-backed crash-released file locks;
-`libc` provides the narrow audited Unix calls needed for process-group signalling,
-handle-relative/no-follow directory opening, child `fchdir`, and nonblocking pipe
-flags. Both dependency decisions, licenses, transitive trees, and failure behavior
-are recorded with the change.
+**Tech Stack:** Rust 1.89 (edition 2021) on macOS/Linux, Cargo, `clap`, `serde`,
+`serde_json`, `sha2`, `libc`, jj 0.41+ CLI, GitHub `gh` CLI/REST API, and
+deterministic fake-command integration tests. Rust's standard `File::try_lock`
+provides OS-backed crash-released file locks; `libc` provides the narrow audited
+Unix calls needed for process-group signalling, handle-relative/no-follow directory
+opening, child `fchdir`, and nonblocking pipe flags. Dependency decisions, licenses,
+transitive pins, and failure behavior are recorded with the change.
+
+## Current implementation status (2026-07-11)
+
+- Tasks 1-10 source and behavioral/model tests are present in the shared
+  uncommitted working copy: exact domain/configuration, bounded command ownership,
+  retained workspace, atomic state/locking/migration, jj/GitHub adapters, planner,
+  executor, typed CLI, fake-binary workflows, package metadata, and bounded CI.
+- Independent validation and the final remediation gate passed formatting,
+  all-target checking, Clippy with warnings denied, package help/version, metadata,
+  dependency-tree inspection, focused fake CLI workflows, the temporary real-jj
+  adapter test, and **221** local tests. The suite includes exact lock-before-
+  observation contention, pending-checkpoint dry-run rendering, and preservation
+  of untracked generated-looking refs.
+- The working copy declares Rust 1.89 consistently in Cargo metadata, README,
+  dependency evidence, and CI. Rust 1.89 itself is not installed on this host, so
+  actual-MSRV and hosted Linux/macOS CI remain release-environment checks rather
+  than locally proven modalities. Live GitHub/network mutation was intentionally
+  not run.
+- Independent semantic/security/performance reviews drove the authority, session,
+  checkpoint, adapter, planner, executor, and CLI remediations recorded in this
+  plan. No commit has yet been created.
 
 ## Global Constraints
 
@@ -465,8 +486,9 @@ jj commit -m $'Resolve repository scope before mutation\n\nValidate the canonica
 
 **Interfaces:**
 - Consumes: canonical workspace root, `Scope`, limits, and a monotonic clock.
-- Produces: `StateStore`, `StateV3`, `OwnershipRecord`, `CheckpointState`,
-  `RepositoryLock`, and `LegacyCandidate`.
+- Produces: `StateStore`, `StateV3`, generated/validated-head `ManagedPr`,
+  provenance-tracked `LegacyMigration`, bounded `CheckpointState`, `RepositoryLock`,
+  and `LegacyCandidate`.
 
 - [ ] **Step 1: Write failing state/lock tests**
 
@@ -488,24 +510,25 @@ Expected: compile failure for the new modules.
 Use:
 
 ```rust
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateV3 {
-    pub schema_version: StateSchemaVersion,
-    pub scope: Scope,
-    pub ownership: BTreeMap<ChangeId, OwnershipRecord>,
-    pub checkpoint: CheckpointState,
+    schema_version: u32,
+    scope: Scope,
+    verified: BTreeMap<ChangeId, ManagedPr>,
+    historic: BTreeMap<ChangeId, ManagedPr>,
+    legacy_migration: LegacyMigration,
+    checkpoint: CheckpointState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum OwnershipRecord {
-    Verified(ManagedPr),
-    LegacyCandidate(LegacyCandidate),
+pub enum LegacyMigration {
+    None,
+    Pending { source_digest: LegacyDigest, candidates: Box<[LegacyCandidate]> },
+    ReadyToDelete { source_digest: LegacyDigest },
+    Complete { source_digest: LegacyDigest },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CheckpointState {
     Idle,
-    Executing(ExecutionCheckpoint),
+    Executing(Box<ExecutionCheckpoint>),
 }
 ```
 
@@ -521,13 +544,13 @@ atomically persisted.
 
 - [ ] **Step 4: Implement OS-released bounded locking**
 
-Validate `<workspace>/.jj/almighty-push/lock` as a regular non-symlink path, open it
-without truncation, and use `fs2::FileExt::try_lock_exclusive` every 10 ms for at
-most five seconds. Keep the locked file handle inside `RepositoryLock`; Drop unlocks
-the handle and never unlinks the path. OS lock release on process death avoids stale
-PID files, age guessing, unsafe deletion, and ABA races. Add `fs2` to `Cargo.toml`
-and document its MIT/Apache-2.0 licensing, small platform-specific transitive tree,
-and blocking/advisory semantics in `CHANGELOG.md` when documentation is rewritten.
+Open `<workspace>/.jj/almighty-push/lock` relative to the retained state-directory
+handle with no-follow/create flags; require a private, singly linked, same-owner
+regular inode. Use standard `File::try_lock` every 10 ms for at most five seconds.
+Keep the locked handle and exact state-directory/lock identities inside
+`RepositoryLock`; every state mutation requires that capability and revalidates the
+namespace. Drop releases the OS lock and never unlinks it. OS release on process
+death avoids stale PID files, age guessing, unsafe deletion, and ABA races.
 
 - [ ] **Step 5: Run state/lock tests and crash simulations**
 
@@ -741,7 +764,11 @@ Cover zero/one/many/maximum stacks; create/update/no-op; reorder; open/closed/me
 interior merged predecessor; exact split (surviving original plus new ID); squash
 (disappearing source plus surviving target); deletion; empty-stack cleanup; duplicate
 ownership; missing state rebuilt from exact managed refs/markers; body preservation;
-`--no-pr`; head deletion; and every effect bound.
+`--no-pr`; head deletion; and every effect bound. The reference model independently
+covers reorder, membership, active/historic/missing location, lifecycle,
+generated/sealed provenance, deletion
+policy, execution mode, typed errors, effect order, and final modeled state with
+explicit coverage counters.
 
 Encode these laws as exhaustive small models for chains up to four:
 
@@ -776,16 +803,21 @@ Expected: compile failure for `almighty_push::plan`.
 Define:
 
 ```rust
+pub enum DryRunMode {
+    Full { delete_closed_heads: bool },
+    NoPr,
+}
+
 pub enum ExecutionMode {
     Full { delete_closed_heads: bool },
     NoPr,
-    DryRun { include_prs: bool, delete_closed_heads: bool },
+    DryRun(DryRunMode),
 }
 
 pub enum Effect {
     Jj(JjEffect),
     Github(GithubEffect),
-    PersistOwnership(PersistedTransition),
+    Ownership(OwnershipEffect),
     Reobserve(ReobserveBarrier),
 }
 
@@ -795,6 +827,11 @@ pub struct Plan {
     pub effects: Box<[Effect]>,
 }
 ```
+
+Active plus historic ownership and exact managed GitHub observations share the same
+configured `change_count_max`; final identity-set preflight accepts the exact maximum
+and rejects one more before effects. Immutable sealed-legacy validation provenance is
+separate from mutable current lifecycle.
 
 Construct owned heads as `almighty-push/<full-change-id>`. The head exists inside
 the configured source repository, so the repository supplies scope without
@@ -817,8 +854,9 @@ disappearing IDs close ownership.
 
 Assert structurally that a no-PR plan contains no `GithubEffect`; a dry-run plan
 contains effect descriptions but no executable mutation capability; and every plan
-has at most 512 effects. Plan IDs use a specified FNV-1a hash over canonical JSON,
-with test vectors so IDs remain stable across runs.
+has at most 512 effects. Plan IDs use SHA-256 over canonical JSON streamed through an
+encoded-byte bound, with test vectors so IDs remain stable across runs. Dry-run action
+rendering uses the same cumulative encoded-byte accounting before allocation.
 
 - [ ] **Step 5: Run planner/model tests and commit**
 
@@ -866,7 +904,7 @@ pub struct ExecutionCheckpoint {
     pub plan_id: PlanId,
     pub scope: Scope,
     pub effects: Box<[Effect]>,
-    pub next_effect_index: usize,
+    pub next_effect_index: u32,
 }
 ```
 
@@ -877,15 +915,23 @@ body immediately before mutation. Before each mutation, re-read its current exte
 value and require either the postcondition
 (already complete) or precondition (safe to execute). After command completion or
 failure, read the postcondition. Persist the incremented index only after the
-postcondition holds. Clear the checkpoint atomically after the last effect.
+postcondition holds. After the last effect, atomically replace the executing
+checkpoint with a durable completed receipt that retains a checked monotone
+execution-occurrence identity, the exact plan and proof prefix, and the derived
+normal/barrier outcome. Resume returns that receipt idempotently. An opaque
+acknowledgement bound to the exact occurrence, proof, outcome, and completed-state
+generation atomically begins the next occurrence, including an equal plan. The new
+checkpoint retains the acknowledged origin so retry is exact across pre-rename and
+post-rename uncertainty. This keeps the terminal outcome recoverable without stale
+P→Q→P receipts aliasing a later equal-plan occurrence.
 
-On startup, a matching-scope checkpoint resumes independently of a newly derived
-plan. Scope mismatch, malformed checkpoint, invalid index, changed precondition, or
-unprovable ownership stops without mutation.
+On startup, a matching-scope executing or completed checkpoint resumes independently
+of a newly derived plan. Scope mismatch, malformed checkpoint, invalid index,
+changed precondition, or unprovable ownership stops without mutation.
 
 - [ ] **Step 4: Implement re-observation outcomes and strict modes**
 
-`ReobserveBarrier` completes the current checkpoint and returns
+`ReobserveBarrier` publishes a durable completed receipt and returns
 `StageOutcome::Reobserve(reason)`. Dry-run uses a renderer and never constructs an
 executor or state writer. No-PR execution is parameterized by a backend that has no
 GitHub client, making `gh` invocation impossible by type and test.
@@ -1089,13 +1135,12 @@ than preserving conflicting authorities.
 - [ ] **Step 2: Complete Cargo package metadata and dependency evidence**
 
 Set MIT license, repository/homepage, readme, keywords, categories, and a tested
-Rust version. Remove `chrono` and `regex` when no new module uses them. Retain `fs2`
-only for advisory crash-safe file locking and `libc` only for audited Unix process-
-group signalling, no-follow directory traversal, child `fchdir`, and nonblocking
-pipe flags; document their licenses, maintenance, transitive trees, and platform
-failure behavior. Run
-`cargo tree --depth 2` and record the final direct dependency set and the `fs2`
-decision in the changelog.
+Rust version. Remove `chrono` and `regex` when no new module uses them. Use standard
+`File::try_lock` for advisory crash-safe locking and retain `libc` only for audited
+Unix process-group signalling, no-follow directory traversal, child `fchdir`, and
+nonblocking pipe/filesystem flags; document dependency licenses, maintenance,
+transitive trees, and platform failure behavior. Run `cargo tree --depth 2` and
+record the final direct dependency set and standard-lock decision in the changelog.
 
 - [ ] **Step 3: Add bounded CI**
 

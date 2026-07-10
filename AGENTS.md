@@ -2,21 +2,22 @@
 
 ## Purpose and current shape
 
-`almighty-push` currently attempts to reconcile described jj changes selected by
-`main@origin..@` with tool-named GitHub head refs and pull requests. It reverses
-`jj log` output and assumes that order is a linear stack; these are observed
-implementation behaviors, not correctness guarantees.
+`almighty-push` reconciles one explicitly scoped, validated linear jj change stack
+with collision-free source head refs and stacked pull requests in an exact target
+GitHub repository. The binary is a thin parser over the typed application control
+plane; deterministic policy remains in the planner and physical effects remain in
+bounded adapters.
 
-All runtime code is currently in `src/main.rs`. It shells out to `jj` and `gh`,
-uses CWD-relative `.almighty` and `.almighty.lock`, and can fetch or rebase local
-history, move remote bookmarks, and create, edit, close, or reopen GitHub pull
-requests. Treat every invocation as a reconciliation attempt with partial,
-irreversible effects, not as a simple push wrapper.
+A full invocation may fetch or rebase local history, move remote refs, mutate
+GitHub pull requests, and atomically publish durable checkpoints. Treat every
+invocation as reconciliation with partial, irreversible effects, not as a simple
+push wrapper. Dry-run and no-PR are distinct capability modes with the guarantees
+in this file and `README.md`.
 
-Current source and directly observed command behavior describe the program.
-`README.md` is the intended user contract and must change with public behavior.
-`PLAN.md`, `ANALYSIS.md`, and `CHANGELOG.md` contain stale or aspirational claims;
-verify them before relying on them.
+Current source, tests, and directly observed command behavior describe the
+program. `README.md` is the intended user contract and must change with public
+behavior. The maintained implementation plan records design history and current
+validation status; it is not authority over current code.
 
 ## Repository workflow
 
@@ -31,17 +32,20 @@ verify them before relying on them.
 
 Assume a normal invocation can mutate local jj operation history, remote
 bookmarks/GitHub head refs (including non-fast-forward moves), GitHub pull
-requests, and CWD-relative `.almighty`/`.almighty.lock`.
+requests, and namespaced state under the canonical `.jj` directory.
 
 Do not run the binary against a real repository or GitHub project while testing
-unless the user explicitly authorizes every mutation class. Current flags are
-not safety sandboxes:
+unless the user explicitly authorizes every mutation class. The capability modes
+are safety boundaries:
 
-- `--dry-run` creates/removes the CWD lock, runs `jj git fetch`, performs remote
-  observations, and does not render a complete execution-equivalent plan.
-- `--no-pr` performs merged-PR handling before its guard, can rebase local
-  history and edit GitHub PR bases, and can erase persisted PR associations.
-- `--delete-branches` invokes unsupported jj syntax and ignores its failure.
+- `--dry-run` performs bounded read-only discovery and observation, creates no
+  lock/state/repository file, fetches or rewrites no local history, mutates no
+  ref or PR, and renders canonical actions plus explicit symbolic continuation
+  when post-mutation identities cannot be known.
+- `--no-pr` requires an explicit base, executes no `gh` process or GitHub effect,
+  and preserves PR ownership/lifecycle records.
+- `--delete-branches` is incompatible with `--no-pr` and deletes only an exact
+  owned source ref through checked GitHub preconditions/postconditions.
 
 Exercise command behavior from a temporary working directory with deterministic
 fake `jj` and `gh` executables first on `PATH`. Never point a fixture at or

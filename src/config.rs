@@ -1,12 +1,18 @@
-use crate::command::{CommandError, CommandExecutor, CommandSpec, SpecError};
+use crate::command::{CommandError, CommandExecutor, CommandSpec, RetainedRepository, SpecError};
 use crate::domain::{DomainError, HeadRef, Limits, RemoteName, RepositoryId, Scope};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fmt::{self, Display, Formatter};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, TryLockError};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigInput {
@@ -18,10 +24,13 @@ pub struct ConfigInput {
     pub github_enabled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ResolvedConfig {
     workspace_root: PathBuf,
     state_directory: PathBuf,
+    workspace_directory: Arc<File>,
+    jj_directory: Arc<File>,
+    configuration_lock: Option<Arc<File>>,
     scope: Scope,
     limits: Limits,
 }
@@ -62,6 +71,36 @@ impl ResolvedConfig {
     pub fn scope(&self) -> &Scope {
         &self.scope
     }
+
+    pub(crate) fn workspace_directory(&self) -> &File {
+        &self.workspace_directory
+    }
+
+    pub(crate) fn jj_directory(&self) -> &File {
+        &self.jj_directory
+    }
+
+    pub(crate) fn has_configuration_lock(&self) -> bool {
+        self.configuration_lock.is_some()
+    }
+
+    pub(crate) fn duplicate_repository(&self) -> Result<RetainedRepository, ConfigError> {
+        let current_workspace = open_directory_no_follow(&self.workspace_root)?;
+        let current_jj = openat_directory(&current_workspace, ".jj")?;
+        let workspace_matches = directory_identity(&current_workspace)?
+            == directory_identity(&self.workspace_directory)?;
+        let jj_matches =
+            directory_identity(&current_jj)? == directory_identity(&self.jj_directory)?;
+        if !workspace_matches || !jj_matches {
+            return Err(ConfigError::WorkspaceIdentityChanged {
+                path: self.workspace_root.clone(),
+            });
+        }
+        Ok(RetainedRepository::new(
+            duplicate_directory(&self.workspace_directory, &self.workspace_root)?,
+            duplicate_directory(&self.jj_directory, &self.workspace_root.join(".jj"))?,
+        ))
+    }
 }
 
 pub enum ConfigError {
@@ -79,6 +118,12 @@ pub enum ConfigError {
     },
     UnsafeWorkspaceMetadata {
         path: PathBuf,
+    },
+    WorkspaceIdentityChanged {
+        path: PathBuf,
+    },
+    ConfigurationLockContended {
+        wait: Duration,
     },
     InvalidRemoteRow {
         bytes: usize,
@@ -119,6 +164,7 @@ pub enum ConfigError {
         base: HeadRef,
         source: Box<CommandError>,
     },
+    GithubCapabilityMissing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +172,7 @@ pub enum WorkspaceIoOperation {
     InvocationCanonicalize,
     ReportedRootCanonicalize,
     MetadataInspect,
+    OpenDirectory,
 }
 
 impl Display for ConfigError {
@@ -153,6 +200,16 @@ impl Display for ConfigError {
                 formatter,
                 "workspace metadata is not a real directory: {}",
                 path.display()
+            ),
+            Self::WorkspaceIdentityChanged { path } => write!(
+                formatter,
+                "resolved workspace identity changed at {}",
+                path.display()
+            ),
+            Self::ConfigurationLockContended { wait } => write!(
+                formatter,
+                "repository configuration lock remained contended for {} ms",
+                wait.as_millis()
             ),
             Self::InvalidRemoteRow { bytes } => {
                 write!(formatter, "invalid {bytes}-byte jj remote row")
@@ -190,6 +247,9 @@ impl Display for ConfigError {
             }
             Self::ConfiguredBaseUnavailable { base, .. } => {
                 write!(formatter, "configured base {base} could not be verified")
+            }
+            Self::GithubCapabilityMissing => {
+                formatter.write_str("GitHub configuration capability is unavailable")
             }
         }
     }
@@ -236,8 +296,9 @@ impl From<DomainError> for ConfigError {
 pub struct ConfigResolver<'a, E> {
     executor: &'a E,
     jj_program: PathBuf,
-    gh_program: PathBuf,
-    environment: Box<[(OsString, OsString)]>,
+    gh_program: Option<PathBuf>,
+    jj_environment: Box<[(OsString, OsString)]>,
+    gh_environment: Box<[(OsString, OsString)]>,
 }
 
 impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
@@ -247,11 +308,42 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         gh_program: PathBuf,
         environment: Box<[(OsString, OsString)]>,
     ) -> Self {
-        Self {
+        Self::new_with_environments(
             executor,
             jj_program,
             gh_program,
+            environment.clone(),
             environment,
+        )
+    }
+
+    pub fn new_with_environments(
+        executor: &'a E,
+        jj_program: PathBuf,
+        gh_program: PathBuf,
+        jj_environment: Box<[(OsString, OsString)]>,
+        gh_environment: Box<[(OsString, OsString)]>,
+    ) -> Self {
+        Self {
+            executor,
+            jj_program,
+            gh_program: Some(gh_program),
+            jj_environment,
+            gh_environment,
+        }
+    }
+
+    pub fn new_without_github(
+        executor: &'a E,
+        jj_program: PathBuf,
+        jj_environment: Box<[(OsString, OsString)]>,
+    ) -> Self {
+        Self {
+            executor,
+            jj_program,
+            gh_program: None,
+            jj_environment,
+            gh_environment: Box::new([]),
         }
     }
 
@@ -259,6 +351,23 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         &self,
         input: &ConfigInput,
         invocation_cwd: &Path,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        self.resolve_with_lock(input, invocation_cwd, false)
+    }
+
+    pub fn resolve_locked(
+        &self,
+        input: &ConfigInput,
+        invocation_cwd: &Path,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        self.resolve_with_lock(input, invocation_cwd, true)
+    }
+
+    fn resolve_with_lock(
+        &self,
+        input: &ConfigInput,
+        invocation_cwd: &Path,
+        lock_before_observation: bool,
     ) -> Result<ResolvedConfig, ConfigError> {
         Scope::validate_tip_revset(&input.tip_revset)?;
         let invocation_cwd =
@@ -280,6 +389,16 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
             return Err(invalid_workspace_root(&root_output.stdout));
         }
         validate_workspace_metadata(&workspace_root)?;
+        let workspace_directory = Arc::new(open_directory_no_follow(&workspace_root)?);
+        let jj_directory = Arc::new(openat_directory(&workspace_directory, ".jj")?);
+        let configuration_lock = if lock_before_observation {
+            Some(Arc::new(acquire_configuration_lock(
+                &jj_directory,
+                input.limits.lock_wait(),
+            )?))
+        } else {
+            None
+        };
 
         let remote_output = self.run(
             &self.jj_program,
@@ -325,6 +444,9 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         Ok(ResolvedConfig {
             state_directory: workspace_root.join(".jj/almighty-push"),
             workspace_root,
+            workspace_directory,
+            jj_directory,
+            configuration_lock,
             scope,
             limits: input.limits,
         })
@@ -339,8 +461,12 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
     ) -> Result<HeadRef, ConfigError> {
         let repository = format!("{}/{}", target.owner(), target.name());
         let endpoint = format!("repos/{repository}");
+        let gh_program = self
+            .gh_program
+            .as_deref()
+            .ok_or(ConfigError::GithubCapabilityMissing)?;
         let output = self.run_os(
-            &self.gh_program,
+            gh_program,
             vec![
                 "api".into(),
                 "--hostname".into(),
@@ -365,7 +491,7 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
             );
             let output = self
                 .run_os(
-                    &self.gh_program,
+                    gh_program,
                     vec![
                         "api".into(),
                         "--hostname".into(),
@@ -422,12 +548,18 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         cwd: &Path,
         limits: Limits,
     ) -> Result<crate::command::CommandOutput, ConfigError> {
+        let environment = if program == self.jj_program.as_path() {
+            self.jj_environment.clone()
+        } else {
+            assert_eq!(Some(program), self.gh_program.as_deref());
+            self.gh_environment.clone()
+        };
         let spec = CommandSpec::new(
             program.as_os_str().to_owned(),
             args.into_boxed_slice(),
             cwd.to_owned(),
             Box::new([]),
-            self.environment.clone(),
+            environment,
             limits,
         )?;
         let output = self.executor.run(&spec)?;
@@ -497,6 +629,102 @@ fn invalid_workspace_root(value: &str) -> ConfigError {
         actual_bytes: value.len(),
         preview: bounded_preview(value),
     }
+}
+
+fn acquire_configuration_lock(directory: &File, wait: Duration) -> Result<File, ConfigError> {
+    let lock = directory
+        .try_clone()
+        .map_err(|source| ConfigError::WorkspaceIo {
+            operation: WorkspaceIoOperation::OpenDirectory,
+            path_preview: ".jj".to_owned(),
+            source: Box::new(source),
+        })?;
+    let deadline = Instant::now() + wait;
+    let mut first_attempt = true;
+    loop {
+        if !first_attempt && Instant::now() >= deadline {
+            return Err(ConfigError::ConfigurationLockContended { wait });
+        }
+        first_attempt = false;
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::WouldBlock) => thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+            Err(TryLockError::Error(source)) => {
+                return Err(ConfigError::WorkspaceIo {
+                    operation: WorkspaceIoOperation::OpenDirectory,
+                    path_preview: ".jj".to_owned(),
+                    source: Box::new(source),
+                });
+            }
+        }
+    }
+}
+
+fn open_directory_no_follow(path: &Path) -> Result<File, ConfigError> {
+    let mut directory = File::open("/").map_err(|source| ConfigError::WorkspaceIo {
+        operation: WorkspaceIoOperation::OpenDirectory,
+        path_preview: "/".to_owned(),
+        source: Box::new(source),
+    })?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(invalid_workspace_root(&path.display().to_string()));
+        };
+        directory = openat_directory_os(&directory, name.as_bytes(), path)?;
+    }
+    Ok(directory)
+}
+
+fn openat_directory(parent: &File, name: &str) -> Result<File, ConfigError> {
+    openat_directory_os(parent, name.as_bytes(), Path::new(name))
+}
+
+fn openat_directory_os(parent: &File, name: &[u8], display: &Path) -> Result<File, ConfigError> {
+    let name =
+        CString::new(name).map_err(|_| invalid_workspace_root(&display.display().to_string()))?;
+    // SAFETY: parent and component are valid; no-follow rejects link traversal.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(ConfigError::WorkspaceIo {
+            operation: WorkspaceIoOperation::OpenDirectory,
+            path_preview: bounded_preview(&display.display().to_string()),
+            source: Box::new(std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn duplicate_directory(directory: &File, path: &Path) -> Result<File, ConfigError> {
+    directory
+        .try_clone()
+        .map_err(|source| ConfigError::WorkspaceIo {
+            operation: WorkspaceIoOperation::OpenDirectory,
+            path_preview: bounded_preview(&path.display().to_string()),
+            source: Box::new(source),
+        })
+}
+
+fn directory_identity(directory: &File) -> Result<(u64, u64), ConfigError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|source| ConfigError::WorkspaceIo {
+            operation: WorkspaceIoOperation::MetadataInspect,
+            path_preview: "retained directory".to_owned(),
+            source: Box::new(source),
+        })?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn bounded_preview(value: &str) -> String {
