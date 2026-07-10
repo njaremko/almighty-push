@@ -531,6 +531,10 @@ impl Scope {
         })
     }
 
+    pub fn validate_tip_revset(value: &str) -> Result<(), DomainError> {
+        validate_selection(value)
+    }
+
     pub fn source_repository(&self) -> &RepositoryId {
         &self.source_repository
     }

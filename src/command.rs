@@ -177,6 +177,10 @@ impl CommandSpec {
         &self.stdin
     }
 
+    pub fn environment_count(&self) -> usize {
+        self.environment.len()
+    }
+
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -478,6 +482,13 @@ pub struct CommandRunner {
     active: AtomicBool,
 }
 
+/// Read-only command execution capability used by deterministic adapters.
+///
+/// Implementations must honor every bound and boundary encoded by `CommandSpec`.
+pub trait CommandExecutor {
+    fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError>;
+}
+
 impl CommandRunner {
     /// Creates the process-wide child-process owner.
     ///
@@ -547,6 +558,12 @@ impl CommandRunner {
         } else {
             Err(attach_result_cleanup(result, cleanup_errors))
         }
+    }
+}
+
+impl CommandExecutor for CommandRunner {
+    fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CommandError> {
+        CommandRunner::run(self, spec)
     }
 }
 

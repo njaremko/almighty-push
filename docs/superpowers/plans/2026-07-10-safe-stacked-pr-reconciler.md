@@ -404,7 +404,7 @@ Define:
 
 ```rust
 pub struct ConfigInput {
-    pub remote: Option<String>,
+    pub remote: Option<RemoteName>,
     pub repository: Option<RepositoryId>,
     pub base: Option<HeadRef>,
     pub tip_revset: String,
@@ -417,22 +417,25 @@ pub struct ResolvedConfig {
     pub state_directory: PathBuf,
     pub source_repository: RepositoryId,
     pub target_repository: RepositoryId,
-    pub remote: String,
+    pub remote: RemoteName,
     pub base: HeadRef,
     pub tip_revset: String,
     pub limits: Limits,
 }
 ```
 
-Resolve the root with `jj workspace root`, canonicalize it, verify `.jj` and its
-parents are directories rather than symlinks, parse `jj git remote list` into exact
-name/URL pairs, and select a remote only when explicitly named or exactly one
-remote exists. In GitHub-enabled mode, verify/discover repository and default base
-through read-only repository calls. When target differs from source, require the
+Resolve the root with `jj --ignore-working-copy workspace root`, require an absolute
+canonical result containing the invocation, verify `.jj` is a real directory rather
+than a symlink, parse `jj --ignore-working-copy git remote list`
+into exact typed name/URL pairs, and select a remote only when explicitly named or
+exactly one remote exists, and bound remote rows before tree insertion. All discovery
+commands receive one explicit bounded environment; inherited ambient variables are
+cleared by the command boundary. In GitHub-enabled mode, use host-pinned `gh api`
+reads to verify exact repository identity, then discover a non-null default base or
+verify the configured base through its percent-encoded exact branch endpoint. When target differs from source, require the
 same GitHub host and preserve both scopes; owned refs are observed/mutated in the
-source while PRs and bases are observed/mutated in the target. In `--no-pr` mode,
-derive the source repository from the selected remote and require `--base` only if
-needed for selection; execute no `gh` process.
+source while PRs and bases are observed/mutated in the target. In `--no-pr` mode, derive the source repository from the selected remote, require
+the otherwise undiscoverable explicit `--base`, and execute no `gh` process.
 
 - [ ] **Step 4: Add tests for every resolution branch and bound**
 
