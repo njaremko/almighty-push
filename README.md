@@ -24,7 +24,15 @@ Every invocation resolves and binds these independent facts:
 - **target repository**: `--repo HOST/OWNER/NAME`, or the source repository;
 - **remote**: `--remote NAME`, or the only configured remote;
 - **base**: `--base REF`, or the target repository's GitHub default branch;
-- **tip**: `--tip REVSET`, defaulting to `@`.
+- **tip**: `--tip REVSET`, or an implicit jj working-copy selection. When the
+  exact `@` commit is both empty and fully undescribed, the implicit selection
+  resolves to `@-`; otherwise it resolves to `@`. An explicit revset is always
+  used exactly as supplied, including `--tip @`.
+
+The effective `@` or `@-` revset is bound into the scope used by observation,
+reports, plans, checkpoints, and persisted state. Resolving an omitted tip adds
+one bounded, structured, read-only query for exact `@`; qualification failure or
+an incomplete result stops the invocation before reconciliation effects.
 
 Source and target may differ for a same-host fork pull request. Cross-host targets, ambiguous remotes, missing bases, unsafe workspace metadata, and non-linear selected graphs are rejected.
 
@@ -41,6 +49,24 @@ almighty-push \
 ```
 
 The selected changes must induce one unique base-to-tip parent/child chain. Selected merges, forks, cycles, disconnected components, duplicate full change IDs, conflicts, and more than 64 changes fail before reconciliation effects.
+
+### Daily jj workflow
+
+A normal `jj commit` records the completed change and creates a fresh empty,
+undescribed child at `@`. Omitting `--tip` skips that fresh working-copy commit:
+
+```console
+jj commit -m 'Complete the change'
+almighty-push --base main
+```
+
+Here the effective tip is `@-`. If `@` has content or a description, omission
+keeps `@` as the effective tip. To intentionally include the exact working-copy
+commit regardless of those properties, supply it explicitly:
+
+```console
+almighty-push --base main --tip @
+```
 
 ## Owned refs and PR bases
 

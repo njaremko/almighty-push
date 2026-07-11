@@ -20,7 +20,8 @@ struct Args {
     #[arg(long, value_parser = parse_base)]
     base: Option<HeadRef>,
 
-    /// Bounded jj revision at the tip of the selected stack.
+    /// Tip revset: effective @- iff exact @ is empty and fully undescribed;
+    /// otherwise effective @; explicit --tip @ means exact @.
     #[arg(long, value_parser = parse_tip)]
     tip: Option<String>,
 

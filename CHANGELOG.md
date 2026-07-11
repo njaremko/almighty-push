@@ -25,6 +25,9 @@
 
 ### CLI
 
+- Omitting `--tip` now follows the ordinary `jj commit` workflow: a fresh empty,
+  undescribed working-copy commit resolves to `@-`, while other working-copy
+  commits remain `@`. Explicit revsets, including `--tip @`, remain exact.
 - Added `--remote`, `--repo`, `--base`, `--tip`, `--dry-run`, `--no-pr`, `--delete-branches`, `--json`, and `--verbose` with typed validation and explicit conflicts.
 - JSON reports include the exact scope and ordered stage identities, action counts, outcomes, canonical dry-run actions, and resulting PR URLs.
 - Runtime failures exit 1; Clap syntax and value failures exit 2.

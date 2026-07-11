@@ -80,13 +80,21 @@ fn malformed_scope_flags_fail_precisely_before_external_execution() {
 
 #[test]
 fn help_and_version_are_successful_without_discovery() {
-    for flag in ["--help", "--version"] {
-        let fixture = fixture(flag.trim_start_matches('-'));
-        let output = fixture.run(&[flag]);
-        assert!(output.status.success());
-        assert!(fixture.records().is_empty());
-        assert!(!fixture.state_directory().exists());
-    }
+    let help_fixture = fixture("help");
+    let help_output = help_fixture.run(&["--help"]);
+    assert!(help_output.status.success());
+    let help = String::from_utf8(help_output.stdout).unwrap();
+    assert!(help.contains("effective @- iff exact @ is empty and fully undescribed"));
+    assert!(help.contains("otherwise effective @"));
+    assert!(help.contains("explicit --tip @ means exact @"));
+    assert!(help_fixture.records().is_empty());
+    assert!(!help_fixture.state_directory().exists());
+
+    let version_fixture = fixture("version");
+    let version_output = version_fixture.run(&["--version"]);
+    assert!(version_output.status.success());
+    assert!(version_fixture.records().is_empty());
+    assert!(!version_fixture.state_directory().exists());
 }
 
 #[test]
