@@ -19,6 +19,8 @@ pub struct CliFixture {
 pub struct CliFixtureOptions {
     pub initial_state: Option<Box<[u8]>>,
     pub fail_github_observations: bool,
+    pub working_copy_empty: bool,
+    pub working_copy_description: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,7 +43,15 @@ impl CliFixture {
         let remote_state = root.join("remote-present");
         let pr_state = root.join("pr-present");
         let fail_gh_reads = root.join("fail-gh-reads");
-        let script = fake_script(&workspace, &log, &remote_state, &pr_state, &fail_gh_reads);
+        let script = fake_script(
+            &workspace,
+            &log,
+            &remote_state,
+            &pr_state,
+            &fail_gh_reads,
+            options.working_copy_empty,
+            options.working_copy_description,
+        );
         for program in ["jj", "gh"] {
             let path = bin.join(program);
             fs::write(&path, &script).unwrap();
@@ -162,12 +172,16 @@ fn fake_script(
     remote: &Path,
     pr: &Path,
     fail_gh_reads: &Path,
+    working_copy_empty: bool,
+    working_copy_description: &str,
 ) -> String {
     let workspace = shell_literal(workspace);
     let log = shell_literal(log);
     let remote = shell_literal(remote);
     let pr = shell_literal(pr);
     let fail_gh_reads = shell_literal(fail_gh_reads);
+    assert!(!working_copy_description.contains(['\'', '\n', '\r']));
+    let working_copy_description = format!("'{working_copy_description}'");
     format!(
         r#"#!/bin/sh
 set -eu
@@ -176,6 +190,8 @@ log={log}
 remote_state={remote}
 pr_state={pr}
 fail_gh_reads={fail_gh_reads}
+working_copy_empty={working_copy_empty}
+working_copy_description={working_copy_description}
 lock_state=unlocked
 if test -f "$workspace/.jj/almighty-push/lock"; then
   lock_state=locked
@@ -183,6 +199,9 @@ fi
 program=${{0##*/}}
 operation=read
 case "$program:$*" in
+  *' --revision @ --limit 2 '*) operation=qualify-tip ;;
+  *'..(@-)'*) operation=stack-parent ;;
+  *'..(@)'*) operation=stack-at ;;
   "jj:--ignore-working-copy git fetch"*) operation=fetch ;;
   "jj:--ignore-working-copy git push"*) operation=push ;;
   "jj:--ignore-working-copy rebase"*) operation=rebase ;;
@@ -215,6 +234,7 @@ if test "$program" = jj; then
   fi
   if test "${{1-}}" = --ignore-working-copy && test "${{2-}}" = log; then
     case " $* " in
+      *' --revision @ --limit 2 '*) printf '%s\n' "{{\"empty\":$working_copy_empty,\"description\":\"$working_copy_description\"}}" ;;
       *"conflicts()"*) exit 0 ;;
       *) printf '%s\n' '{{"change_id":"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk","commit_id":"1111111111111111111111111111111111111111","description":"root | description"}}' ;;
     esac

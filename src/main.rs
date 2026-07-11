@@ -1,4 +1,5 @@
 use almighty_push::app::{self, RequestedMode, RunOptions};
+use almighty_push::config::TipSelection;
 use almighty_push::domain::{HeadRef, Limits, RemoteName, RepositoryId, Scope};
 use clap::Parser;
 use std::process::ExitCode;
@@ -20,8 +21,8 @@ struct Args {
     base: Option<HeadRef>,
 
     /// Bounded jj revision at the tip of the selected stack.
-    #[arg(long, default_value = "@", value_parser = parse_tip)]
-    tip: String,
+    #[arg(long, value_parser = parse_tip)]
+    tip: Option<String>,
 
     /// Render canonical actions without locking, fetching, or mutating anything.
     #[arg(long)]
@@ -66,12 +67,16 @@ fn main() -> ExitCode {
     if args.verbose {
         eprintln!("almighty-push: resolving exact repository scope");
     }
+    let tip_selection = match args.tip {
+        Some(revset) => TipSelection::ExplicitRevset(revset),
+        None => TipSelection::ImplicitWorkingCopy,
+    };
     match app::run(
         RunOptions {
             remote: args.remote,
             repository: args.repository,
             base: args.base,
-            tip_revset: args.tip,
+            tip_selection,
             mode,
             limits: Limits::default(),
         },

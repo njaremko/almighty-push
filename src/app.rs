@@ -91,7 +91,7 @@ pub struct RunOptions {
     pub remote: Option<RemoteName>,
     pub repository: Option<RepositoryId>,
     pub base: Option<HeadRef>,
-    pub tip_revset: String,
+    pub tip_selection: TipSelection,
     pub mode: RequestedMode,
     pub limits: Limits,
 }
@@ -285,7 +285,7 @@ fn run_with_executor<E: CommandExecutor>(
         remote: options.remote,
         repository: options.repository,
         base: options.base,
-        tip_selection: TipSelection::ExplicitRevset(options.tip_revset),
+        tip_selection: options.tip_selection,
         limits: options.limits,
         github_enabled,
     };

@@ -31,9 +31,10 @@ fn dry_run_no_pr_renders_canonical_actions_without_any_persistent_or_external_mu
     assert!(!fixture.pr_was_mutated());
     let records = fixture.records();
     assert!(records.iter().all(|record| record.program == "jj"));
-    assert!(records
-        .iter()
-        .all(|record| matches!(record.operation.as_str(), "read")));
+    assert!(records.iter().all(|record| matches!(
+        record.operation.as_str(),
+        "read" | "qualify-tip" | "stack-at"
+    )));
 }
 
 #[test]
@@ -44,10 +45,8 @@ fn no_pr_requires_explicit_base_before_any_gh_process_or_mutation() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--base is required"));
-    assert!(fixture
-        .records()
-        .iter()
-        .all(|record| record.program != "gh" && record.operation == "read"));
+    assert!(fixture.records().iter().all(|record| record.program != "gh"
+        && matches!(record.operation.as_str(), "read" | "qualify-tip")));
     assert!(!fixture.state_directory().exists());
     assert!(!fixture.remote_was_mutated());
 }
@@ -116,7 +115,7 @@ fn malformed_future_and_cross_scope_state_stop_before_reconciliation_mutation() 
             fixture
                 .records()
                 .iter()
-                .all(|record| record.operation == "read"),
+                .all(|record| matches!(record.operation.as_str(), "read" | "qualify-tip")),
             "{label}"
         );
     }

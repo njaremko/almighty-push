@@ -43,6 +43,123 @@ fn fixture(label: &str) -> CliFixture {
 }
 
 #[test]
+fn omitted_tip_reports_parent_for_a_fresh_jj_working_copy() {
+    let fixture = CliFixture::new(
+        "omitted-fresh-working-copy",
+        CliFixtureOptions {
+            working_copy_empty: true,
+            ..CliFixtureOptions::default()
+        },
+    );
+
+    let output = fixture.run(&["--dry-run", "--no-pr", "--base", "main", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = CliFixture::json_stdout(&output);
+    assert_eq!(report["tip"], "@-");
+    let records = fixture.records();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.operation == "qualify-tip")
+            .count(),
+        1
+    );
+    assert!(records
+        .iter()
+        .any(|record| record.operation == "stack-parent"));
+    assert!(records.iter().all(|record| !record.lock_path_present));
+    assert!(records.iter().all(|record| matches!(
+        record.operation.as_str(),
+        "read" | "qualify-tip" | "stack-parent"
+    )));
+    assert!(!fixture.state_directory().exists());
+    assert!(!fixture.remote_was_mutated());
+    assert!(!fixture.pr_was_mutated());
+}
+
+#[test]
+fn omitted_fresh_working_copy_persists_parent_tip_in_no_pr_mode() {
+    let fixture = CliFixture::new(
+        "omitted-fresh-working-copy-no-pr",
+        CliFixtureOptions {
+            working_copy_empty: true,
+            ..CliFixtureOptions::default()
+        },
+    );
+
+    let output = fixture.run(&["--no-pr", "--base", "main", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = CliFixture::json_stdout(&output);
+    assert_eq!(report["tip"], "@-");
+    let state_path = fixture.workspace().join(".jj/almighty-push/state-v3.json");
+    let state: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(state["scope"]["tip_revset"], "@-");
+
+    let records = fixture.records();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.operation == "qualify-tip")
+            .count(),
+        1
+    );
+    assert!(records
+        .iter()
+        .any(|record| record.operation == "stack-parent"));
+    assert!(records.iter().all(|record| record.program == "jj"));
+    assert!(records
+        .iter()
+        .filter(|record| matches!(record.operation.as_str(), "fetch" | "push" | "rebase"))
+        .all(|record| record.lock_path_present));
+    assert!(fixture.remote_was_mutated());
+    assert!(!fixture.pr_was_mutated());
+}
+
+#[test]
+fn explicit_at_remains_exact_for_a_fresh_jj_working_copy() {
+    let fixture = CliFixture::new(
+        "explicit-at-fresh-working-copy",
+        CliFixtureOptions {
+            working_copy_empty: true,
+            ..CliFixtureOptions::default()
+        },
+    );
+
+    let output = fixture.run(&[
+        "--dry-run",
+        "--no-pr",
+        "--base",
+        "main",
+        "--tip",
+        "@",
+        "--json",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = CliFixture::json_stdout(&output);
+    assert_eq!(report["tip"], "@");
+    let records = fixture.records();
+    assert!(records
+        .iter()
+        .all(|record| record.operation != "qualify-tip"));
+    assert!(records.iter().any(|record| record.operation == "stack-at"));
+}
+
+#[test]
 fn no_pr_executes_only_locked_jj_stages_and_preserves_pr_ownership() {
     let fixture = fixture("no-pr-workflow");
 
@@ -69,7 +186,7 @@ fn no_pr_executes_only_locked_jj_stages_and_preserves_pr_ownership() {
     assert!(fixture
         .records()
         .iter()
-        .filter(|record| record.operation != "read")
+        .filter(|record| matches!(record.operation.as_str(), "fetch" | "push" | "rebase"))
         .all(|record| record.lock_path_present));
 }
 
@@ -167,9 +284,10 @@ fn dry_run_full_observes_github_but_never_fetches_locks_or_mutates() {
     assert!(!fixture.pr_was_mutated());
     let records = fixture.records();
     assert!(records.iter().any(|record| record.program == "gh"));
-    assert!(records
-        .iter()
-        .all(|record| matches!(record.operation.as_str(), "read" | "gh-read")));
+    assert!(records.iter().all(|record| matches!(
+        record.operation.as_str(),
+        "read" | "qualify-tip" | "stack-at" | "gh-read"
+    )));
 }
 
 #[test]
