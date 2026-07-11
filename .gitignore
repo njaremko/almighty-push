@@ -1,5 +1,5 @@
 .jj
-.almighty.lock
+.DS_Store
 target
 __pycache__
 *.local.*
