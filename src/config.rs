@@ -14,12 +14,24 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const WORKING_COPY_JSON_TEMPLATE: &str = r#"concat(
+  "{\"empty\":", json(empty),
+  ",\"description\":", json(description),
+  "}\n"
+)"#;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TipSelection {
+    ImplicitWorkingCopy,
+    ExplicitRevset(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigInput {
     pub remote: Option<RemoteName>,
     pub repository: Option<RepositoryId>,
     pub base: Option<HeadRef>,
-    pub tip_revset: String,
+    pub tip_selection: TipSelection,
     pub limits: Limits,
     pub github_enabled: bool,
 }
@@ -128,6 +140,12 @@ pub enum ConfigError {
     InvalidRemoteRow {
         bytes: usize,
     },
+    WorkingCopyJson {
+        source: Box<serde_json::Error>,
+    },
+    WorkingCopyRowCount {
+        count: usize,
+    },
     DuplicateRemote {
         remote: RemoteName,
     },
@@ -214,6 +232,13 @@ impl Display for ConfigError {
             Self::InvalidRemoteRow { bytes } => {
                 write!(formatter, "invalid {bytes}-byte jj remote row")
             }
+            Self::WorkingCopyJson { source } => {
+                write!(formatter, "invalid jj working-copy JSON: {source}")
+            }
+            Self::WorkingCopyRowCount { count } => write!(
+                formatter,
+                "jj working-copy qualification returned {count} rows, expected exactly one"
+            ),
             Self::DuplicateRemote { remote } => write!(formatter, "duplicate remote {remote}"),
             Self::MissingRemote { remote } => write!(formatter, "remote {remote} does not exist"),
             Self::NoRemotes => formatter.write_str("no Git remotes were observed"),
@@ -269,6 +294,7 @@ impl Error for ConfigError {
             Self::Domain(error) => Some(error.as_ref()),
             Self::ConfiguredBaseUnavailable { source, .. } => Some(source.as_ref()),
             Self::WorkspaceIo { source, .. } => Some(source.as_ref()),
+            Self::WorkingCopyJson { source } => Some(source.as_ref()),
             Self::GithubJson { source } => Some(source.as_ref()),
             _ => None,
         }
@@ -369,7 +395,9 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         invocation_cwd: &Path,
         lock_before_observation: bool,
     ) -> Result<ResolvedConfig, ConfigError> {
-        Scope::validate_tip_revset(&input.tip_revset)?;
+        if let TipSelection::ExplicitRevset(revset) = &input.tip_selection {
+            Scope::validate_tip_revset(revset)?;
+        }
         let invocation_cwd =
             invocation_cwd
                 .canonicalize()
@@ -421,6 +449,8 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
             .into());
         }
 
+        let tip_revset =
+            self.resolve_tip_revset(&input.tip_selection, &workspace_root, input.limits)?;
         let base = if input.github_enabled {
             self.resolve_github_base(
                 &target_repository,
@@ -439,7 +469,7 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
             target_repository,
             remote,
             base,
-            input.tip_revset.clone(),
+            tip_revset,
         )?;
         Ok(ResolvedConfig {
             state_directory: workspace_root.join(".jj/almighty-push"),
@@ -450,6 +480,49 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
             scope,
             limits: input.limits,
         })
+    }
+
+    fn resolve_tip_revset(
+        &self,
+        selection: &TipSelection,
+        workspace_root: &Path,
+        limits: Limits,
+    ) -> Result<String, ConfigError> {
+        if let TipSelection::ExplicitRevset(revset) = selection {
+            return Ok(revset.clone());
+        }
+        let output = self.run(
+            &self.jj_program,
+            [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "--revision",
+                "@",
+                "--limit",
+                "2",
+                "--template",
+                WORKING_COPY_JSON_TEMPLATE,
+            ],
+            workspace_root,
+            limits,
+        )?;
+        let mut rows = output.stdout.lines();
+        let Some(row) = rows.next() else {
+            return Err(ConfigError::WorkingCopyRowCount { count: 0 });
+        };
+        let row: WorkingCopyRow =
+            serde_json::from_str(row).map_err(|source| ConfigError::WorkingCopyJson {
+                source: Box::new(source),
+            })?;
+        if rows.next().is_some() {
+            return Err(ConfigError::WorkingCopyRowCount { count: 2 });
+        }
+        if row.empty && row.description.is_empty() {
+            Ok("@-".to_owned())
+        } else {
+            Ok("@".to_owned())
+        }
     }
 
     fn resolve_github_base(
@@ -570,6 +643,13 @@ impl<'a, E: CommandExecutor> ConfigResolver<'a, E> {
         }
         Ok(output)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkingCopyRow {
+    empty: bool,
+    description: String,
 }
 
 #[derive(Deserialize)]

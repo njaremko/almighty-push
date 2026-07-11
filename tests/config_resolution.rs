@@ -1,5 +1,7 @@
 use almighty_push::command::{CommandError, CommandExecutor, CommandOutput, CommandSpec};
-use almighty_push::config::{repository_from_remote_url, ConfigError, ConfigInput, ConfigResolver};
+use almighty_push::config::{
+    repository_from_remote_url, ConfigError, ConfigInput, ConfigResolver, TipSelection,
+};
 use almighty_push::domain::{HeadRef, LimitValues, Limits, RemoteName, RepositoryId};
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -8,12 +10,18 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[derive(Clone, Copy)]
+enum FakeFailure {
+    Exit,
+    Timeout,
+}
+
 struct FakeExecutor {
     replies: Mutex<VecDeque<CommandOutput>>,
     programs: Mutex<Vec<OsString>>,
     arguments: Mutex<Vec<Vec<OsString>>>,
     contracts: Mutex<Vec<(PathBuf, usize, Duration, usize)>>,
-    failure_at: Option<usize>,
+    failure: Option<(usize, FakeFailure)>,
 }
 
 impl FakeExecutor {
@@ -31,13 +39,19 @@ impl FakeExecutor {
             programs: Mutex::new(Vec::new()),
             arguments: Mutex::new(Vec::new()),
             contracts: Mutex::new(Vec::new()),
-            failure_at: None,
+            failure: None,
         }
     }
 
     fn failing<S: AsRef<str>>(replies: impl IntoIterator<Item = S>, failure_at: usize) -> Self {
         let mut executor = Self::new(replies);
-        executor.failure_at = Some(failure_at);
+        executor.failure = Some((failure_at, FakeFailure::Exit));
+        executor
+    }
+
+    fn timing_out<S: AsRef<str>>(replies: impl IntoIterator<Item = S>, failure_at: usize) -> Self {
+        let mut executor = Self::new(replies);
+        executor.failure = Some((failure_at, FakeFailure::Timeout));
         executor
     }
 
@@ -73,12 +87,19 @@ impl CommandExecutor for FakeExecutor {
             spec.timeout(),
             spec.output_limit_bytes(),
         ));
-        if self.failure_at == Some(call_index) {
-            return Err(CommandError::Exit {
-                status_code: Some(1),
-                stdout: String::new(),
-                stderr: "not found".to_owned(),
-            });
+        if let Some((failure_at, failure)) = self.failure {
+            if failure_at == call_index {
+                return Err(match failure {
+                    FakeFailure::Exit => CommandError::Exit {
+                        status_code: Some(1),
+                        stdout: String::new(),
+                        stderr: "not found".to_owned(),
+                    },
+                    FakeFailure::Timeout => CommandError::Timeout {
+                        timeout: spec.timeout(),
+                    },
+                });
+            }
         }
         Ok(self.replies.lock().unwrap().pop_front().unwrap())
     }
@@ -99,10 +120,181 @@ fn input(github_enabled: bool) -> ConfigInput {
         remote: Some(RemoteName::parse("origin").unwrap()),
         repository: None,
         base: Some(HeadRef::parse("main").unwrap()),
-        tip_revset: "@".to_owned(),
+        tip_selection: TipSelection::ExplicitRevset("@".to_owned()),
         limits: limits(),
         github_enabled,
     }
+}
+
+#[test]
+fn implicit_tip_skips_only_a_fresh_working_copy() {
+    for (empty, description, expected) in [
+        (true, "", "@-"),
+        (true, "named empty change", "@"),
+        (false, "", "@"),
+    ] {
+        let workspace = workspace();
+        let tip_row = serde_json::json!({
+            "empty": empty,
+            "description": description,
+        });
+        let executor = FakeExecutor::new([
+            workspace.to_string_lossy().into_owned(),
+            "origin https://github.com/owner/project.git\n".to_owned(),
+            format!("{tip_row}\n"),
+        ]);
+        let resolver =
+            ConfigResolver::new_without_github(&executor, PathBuf::from("/fake/jj"), Box::new([]));
+        let mut config = input(false);
+        config.tip_selection = TipSelection::ImplicitWorkingCopy;
+
+        let resolved = resolver.resolve(&config, &workspace).unwrap();
+
+        assert_eq!(resolved.tip_revset(), expected);
+        assert_eq!(resolved.scope().tip_revset(), expected);
+        let calls = executor.arguments();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[2],
+            [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "--revision",
+                "@",
+                "--limit",
+                "2",
+                "--template",
+                r#"concat(
+  "{\"empty\":", json(empty),
+  ",\"description\":", json(description),
+  "}\n"
+)"#,
+            ]
+            .map(OsString::from)
+        );
+        fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[test]
+fn explicit_tip_is_not_qualified_or_rewritten() {
+    let workspace = workspace();
+    let executor = FakeExecutor::new([
+        workspace.to_str().unwrap(),
+        "origin https://github.com/owner/project.git\n",
+    ]);
+    let resolver =
+        ConfigResolver::new_without_github(&executor, PathBuf::from("/fake/jj"), Box::new([]));
+
+    let resolved = resolver.resolve(&input(false), &workspace).unwrap();
+
+    assert_eq!(resolved.tip_revset(), "@");
+    assert_eq!(executor.arguments().len(), 2);
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn implicit_tip_rejects_malformed_and_non_singleton_rows() {
+    for (output, expected_count) in [
+        ("", Some(0)),
+        (
+            "{\"empty\":true,\"description\":\"\"}\n{\"empty\":true,\"description\":\"\"}\n",
+            Some(2),
+        ),
+        ("{broken\n", None),
+    ] {
+        let workspace = workspace();
+        let executor = FakeExecutor::new([
+            workspace.to_str().unwrap(),
+            "origin https://github.com/owner/project.git\n",
+            output,
+        ]);
+        let resolver =
+            ConfigResolver::new_without_github(&executor, PathBuf::from("/fake/jj"), Box::new([]));
+        let mut config = input(false);
+        config.tip_selection = TipSelection::ImplicitWorkingCopy;
+
+        let error = resolver.resolve(&config, &workspace).unwrap_err();
+
+        match expected_count {
+            Some(count) => assert!(matches!(
+                error,
+                ConfigError::WorkingCopyRowCount { count: actual } if actual == count
+            )),
+            None => {
+                assert!(matches!(error, ConfigError::WorkingCopyJson { .. }));
+                assert!(std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<serde_json::Error>()
+                    .is_some());
+            }
+        }
+        assert_eq!(executor.arguments().len(), 3);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[test]
+fn implicit_tip_command_failure_stops_configuration() {
+    let workspace = workspace();
+    let executor = FakeExecutor::failing(
+        [
+            workspace.to_str().unwrap(),
+            "origin https://github.com/owner/project.git\n",
+        ],
+        2,
+    );
+    let resolver =
+        ConfigResolver::new_without_github(&executor, PathBuf::from("/fake/jj"), Box::new([]));
+    let mut config = input(false);
+    config.tip_selection = TipSelection::ImplicitWorkingCopy;
+
+    assert!(matches!(
+        resolver.resolve(&config, &workspace),
+        Err(ConfigError::Command(_))
+    ));
+    assert_eq!(executor.arguments().len(), 3);
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn implicit_tip_propagates_timeout_and_output_bounds() {
+    let workspace = workspace();
+    let timeout = FakeExecutor::timing_out(
+        [
+            workspace.to_str().unwrap(),
+            "origin https://github.com/owner/project.git\n",
+        ],
+        2,
+    );
+    let resolver =
+        ConfigResolver::new_without_github(&timeout, PathBuf::from("/fake/jj"), Box::new([]));
+    let mut config = input(false);
+    config.tip_selection = TipSelection::ImplicitWorkingCopy;
+    assert!(matches!(
+        resolver.resolve(&config, &workspace),
+        Err(ConfigError::Command(error))
+            if matches!(error.as_ref(), CommandError::Timeout { .. })
+    ));
+    assert_eq!(timeout.arguments().len(), 3);
+
+    let oversized = FakeExecutor::new([
+        workspace.to_string_lossy().into_owned(),
+        "origin https://github.com/owner/project.git\n".to_owned(),
+        "x".repeat(65_537),
+    ]);
+    let resolver =
+        ConfigResolver::new_without_github(&oversized, PathBuf::from("/fake/jj"), Box::new([]));
+    assert!(matches!(
+        resolver.resolve(&config, &workspace),
+        Err(ConfigError::ExecutorOutputLimit {
+            bytes: 65_537,
+            max: 65_536,
+        })
+    ));
+    assert_eq!(oversized.arguments().len(), 3);
+    fs::remove_dir_all(workspace).unwrap();
 }
 
 #[test]
@@ -658,7 +850,7 @@ fn invalid_tip_is_rejected_before_any_observation() {
             Box::new([]),
         );
         let mut config = input(false);
-        config.tip_revset = invalid;
+        config.tip_selection = TipSelection::ExplicitRevset(invalid);
         assert!(matches!(
             resolver.resolve(&config, &workspace),
             Err(ConfigError::Domain(_))
@@ -677,7 +869,7 @@ fn invalid_tip_is_rejected_before_any_observation() {
         Box::new([]),
     );
     let mut config = input(false);
-    config.tip_revset = "x".repeat(1_024);
+    config.tip_selection = TipSelection::ExplicitRevset("x".repeat(1_024));
     assert!(resolver.resolve(&config, &workspace).is_ok());
     fs::remove_dir_all(workspace).unwrap();
 }

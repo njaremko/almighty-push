@@ -1,5 +1,5 @@
 use crate::command::{CommandExecutor, CommandRunner};
-use crate::config::{ConfigError, ConfigInput, ConfigResolver, ResolvedConfig};
+use crate::config::{ConfigError, ConfigInput, ConfigResolver, ResolvedConfig, TipSelection};
 use crate::domain::{DomainError, HeadRef, Limits, RemoteName, RepositoryId};
 use crate::executor::{
     CompletionAcknowledgement, Executor, ExecutorError, FullEffectDriver, FullEffectDriverError,
@@ -285,7 +285,7 @@ fn run_with_executor<E: CommandExecutor>(
         remote: options.remote,
         repository: options.repository,
         base: options.base,
-        tip_revset: options.tip_revset,
+        tip_selection: TipSelection::ExplicitRevset(options.tip_revset),
         limits: options.limits,
         github_enabled,
     };

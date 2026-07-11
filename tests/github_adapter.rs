@@ -2,7 +2,7 @@ use almighty_push::body::{BodyMerge, ManagedBody, ManagedSection};
 use almighty_push::command::{
     CommandError, CommandExecutor, CommandOutput, CommandRunner, CommandSpec,
 };
-use almighty_push::config::{ConfigInput, ConfigResolver, ResolvedConfig};
+use almighty_push::config::{ConfigInput, ConfigResolver, ResolvedConfig, TipSelection};
 use almighty_push::domain::{
     ChangeId, CommitId, HeadRef, LimitValues, Limits, PrLifecycle, PrNumber, RemoteName,
     RepositoryId, Scope,
@@ -190,7 +190,7 @@ fn resolved_for(root: &Path, target: &str, configured_limits: Limits) -> Resolve
             remote: Some(RemoteName::parse("origin").unwrap()),
             repository: Some(RepositoryId::parse(target).unwrap()),
             base: Some(HeadRef::parse("main").unwrap()),
-            tip_revset: "@".to_owned(),
+            tip_selection: TipSelection::ExplicitRevset("@".to_owned()),
             limits: configured_limits,
             github_enabled: false,
         },

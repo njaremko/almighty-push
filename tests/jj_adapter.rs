@@ -1,7 +1,9 @@
 use almighty_push::command::{
     CommandError, CommandExecutor, CommandOutput, CommandRunner, CommandSpec,
 };
-use almighty_push::config::{ConfigError, ConfigInput, ConfigResolver, ResolvedConfig};
+use almighty_push::config::{
+    ConfigError, ConfigInput, ConfigResolver, ResolvedConfig, TipSelection,
+};
 use almighty_push::domain::{
     ChangeId, CommitId, DomainError, HeadRef, LimitValues, Limits, RemoteName, RepositoryId,
 };
@@ -224,7 +226,7 @@ fn resolver_config(workspace: &Path, locked: bool) -> ResolvedConfig {
         remote: Some(RemoteName::parse("origin").unwrap()),
         repository: Some(RepositoryId::parse("github.com/source/project").unwrap()),
         base: Some(HeadRef::parse("main").unwrap()),
-        tip_revset: "@".to_owned(),
+        tip_selection: TipSelection::ExplicitRevset("@".to_owned()),
         limits: limits(),
         github_enabled: false,
     };

@@ -1,5 +1,5 @@
 use almighty_push::command::{CommandError, CommandExecutor, CommandOutput, CommandSpec};
-use almighty_push::config::{ConfigInput, ConfigResolver};
+use almighty_push::config::{ConfigInput, ConfigResolver, TipSelection};
 use almighty_push::domain::{HeadRef, Limits, RemoteName};
 use almighty_push::state::{StateStore, StateV3};
 use std::collections::VecDeque;
@@ -37,7 +37,7 @@ fn resolved(root: &Path) -> almighty_push::config::ResolvedConfig {
             remote: Some(RemoteName::parse("origin").unwrap()),
             repository: None,
             base: Some(HeadRef::parse("main").unwrap()),
-            tip_revset: "@".to_owned(),
+            tip_selection: TipSelection::ExplicitRevset("@".to_owned()),
             limits: Limits::default(),
             github_enabled: false,
         },
